@@ -252,13 +252,14 @@ fn confirm(message: &str, auto_yes: bool) -> anyhow::Result<bool> {
         return Ok(true);
     }
 
-    print!("  {}  {} [Y/n] ", "?".cyan().bold(), message);
+    println!();
+    println!("  {}  {} [Y/n]", "?".cyan().bold(), message);
+    print!("  > ");
     io::stdout().flush()?;
-
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-
     let trimmed = input.trim().to_lowercase();
+    println!();
     Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
 }
 
