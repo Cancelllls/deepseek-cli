@@ -1,0 +1,4 @@
+We need to implement these features in the project /home/ubuntu/Deepseek-CLI. Let's first explore the existing codebase to understand structure. Then write the necessary code files.
+
+I'll list the directory first.===RUN cmd
+find /home/ubuntu/Deepseek-CLI -type f | head -100

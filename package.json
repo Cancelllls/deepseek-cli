@@ -1,0 +1,24 @@
+```
+{
+  "name": "deepseek-cli",
+  "version": "1.0.0",
+  "description": "CLI for Deepseek",
+  "main": "index.js",
+  "bin": {
+    "deepseek": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "mocha --recursive test"
+  },
+  "dependencies": {
+    "commander": "^9.0.",
+    "axios": "^1.4.0"
+  },
+  "devependencies": {
+    "mocha": "^10.2.0",
+    "chai": "^4.3.7",
+    "sinon": "^15.0.0"
+  }
+}
+```
