@@ -150,28 +150,27 @@ pub async fn execute_plan(
 
 fn build_executor_system_prompt(skills: &[crate::skills::Skill]) -> String {
     let base = skills::build_system_prompt(skills, "");
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".into());
 
     format!(
         "{}\n\n\
-         ## Critical Rules for Tool Usage\n\n\
-         You MUST use tools for EVERY action. Never describe what you will do — DO it.\n\n\
-         Available tools:\n\n\
-         ```\n\
+         You are in: {}\n\n\
+         ## Tools (use EXACTLY this format — one tool per response, no explanation):\n\n\
          TOOL: read_file path=\"relative/path\"\n\
          TOOL: write_file path=\"relative/path\"\n\
          <file content on next lines>\n\
          TOOL: run_command cmd=\"shell command\"\n\
          TOOL: search_code pattern=\"regex\"\n\
-         TOOL: list_dir path=\"relative/path\"\n\
-         ```\n\n\
-         Rules:\n\
-         - ONE tool per response. No text before or after.\n\
-         - For write_file: first line is TOOL, remaining lines are file content.\n\
-         - Reply ALL_DONE ONLY when every task step is complete.\n\
-         - Do NOT describe tools — USE them.\n\
-         - If you need to see a file, use read_file. If you need to change it, use write_file.\n\
-         - Never say you will read something — just read it.",
-        base
+         TOOL: list_dir path=\"relative/path\"\n\n\
+         RULES:\n\
+         - ONE tool per response. NOTHING else — no description, no greeting.\n\
+         - For write_file: first line is TOOL, rest is file content.\n\
+         - Reply ALL_DONE only when all steps complete.\n\
+         - If a file read fails, check the error output — it lists actual files.\n\
+         - Do not describe tools — USE them immediately.",
+        base, cwd
     )
 }
 
@@ -245,17 +244,31 @@ fn describe_tool(tool: &ToolCall) -> String {
 async fn execute_tool(tool: &ToolCall) -> ToolResult {
     match tool {
         ToolCall::ReadFile { path } => {
+            let full = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
             match std::fs::read_to_string(path) {
                 Ok(content) => ToolResult {
                     tool: "read_file".into(),
                     success: true,
-                    output: format!("File: {}\n{}", path, content),
+                    output: format!("Contents of {} ({} bytes):\n{}", full.display(), content.len(), content),
                 },
-                Err(e) => ToolResult {
-                    tool: "read_file".into(),
-                    success: false,
-                    output: format!("Error reading {}: {}", path, e),
-                },
+                Err(e) => {
+                    // Try to help the model by listing what's actually there
+                    let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+                    let mut hint = format!("Error: {}\n", e);
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        hint.push_str(&format!("Files in {}:\n", dir.display()));
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            hint.push_str(&format!("  {}{}\n", name, if is_dir { "/" } else { "" }));
+                        }
+                    }
+                    ToolResult {
+                        tool: "read_file".into(),
+                        success: false,
+                        output: hint,
+                    }
+                }
             }
         }
         ToolCall::WriteFile { path, content } => {
@@ -333,12 +346,16 @@ async fn execute_tool(tool: &ToolCall) -> ToolResult {
         ToolCall::ListDir { path } => {
             match std::fs::read_dir(path) {
                 Ok(entries) => {
-                    let mut out = String::new();
-                    for entry in entries.filter_map(|e| e.ok()) {
+                    let mut out = format!("Contents of {}:\n", path);
+                    let mut items: Vec<String> = Vec::new();
+                    for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        let is_dir = entry.file_type().ok().map(|t| t.is_dir()).unwrap_or(false);
-                        out.push_str(&format!("{}  {}\n", if is_dir { "📁" } else { "📄" }, name));
+                        if name.starts_with('.') { continue; }
+                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        items.push(format!("  {}{}", name, if is_dir { "/" } else { "" }));
                     }
+                    items.sort();
+                    out.push_str(&items.join("\n"));
                     ToolResult {
                         tool: "list_dir".into(),
                         success: true,

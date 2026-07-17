@@ -73,21 +73,46 @@ pub async fn generate_plan(
 pub fn gather_project_context() -> String {
     let mut ctx = String::new();
 
-    let entries = [
-        ("package.json", "Node.js/TypeScript"),
-        ("Cargo.toml", "Rust"),
-        ("go.mod", "Go"),
-        ("requirements.txt", "Python"),
-        ("pyproject.toml", "Python"),
-        ("Gemfile", "Ruby"),
-        ("tsconfig.json", "TypeScript"),
-        ("next.config", "Next.js"),
-        ("Dockerfile", "Docker"),
-    ];
+    // Working directory
+    if let Ok(cwd) = std::env::current_dir() {
+        ctx.push_str(&format!("Working directory: {}\n", cwd.display()));
+    }
 
-    for (file, desc) in &entries {
-        if std::path::Path::new(file).exists() {
-            ctx.push_str(&format!("- {} project ({})\n", desc, file));
+    // Top-level listing
+    ctx.push_str("\nProject structure:\n");
+    if let Ok(entries) = std::fs::read_dir(".") {
+        let mut items: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                items.push(format!("{}/", name));
+            } else {
+                items.push(name);
+            }
+        }
+        items.sort();
+        for item in items.iter().take(40) {
+            ctx.push_str(&format!("  {}\n", item));
+        }
+        if items.len() > 40 {
+            ctx.push_str(&format!("  ... and {} more\n", items.len() - 40));
+        }
+    }
+
+    // Key files
+    let key_files = [
+        "Cargo.toml", "package.json", "go.mod", "requirements.txt",
+        "pyproject.toml", "Makefile", "Dockerfile", "tsconfig.json",
+    ];
+    ctx.push_str("\nKey files found:\n");
+    for f in &key_files {
+        if std::path::Path::new(f).exists() {
+            let content = std::fs::read_to_string(f).unwrap_or_default();
+            let summary: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
+            ctx.push_str(&format!("\n--- {} ---\n{}\n", f, summary));
         }
     }
 
