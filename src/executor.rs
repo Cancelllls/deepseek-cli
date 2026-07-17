@@ -90,8 +90,12 @@ fn build_executor_system_prompt(skills: &[crate::skills::Skill]) -> String {
 }
 
 fn parse_tool(response: &str) -> Option<ToolCall> {
-    let re = Regex::new(r"TOOL:\s*(\w+)\s*(.*)").ok()?;
-    let cap = re.captures(response)?;
+    // Strip optional TOOL: prefix, match just the tool call
+    let text = response.trim();
+    let text = text.strip_prefix("TOOL:").unwrap_or(text).trim();
+
+    let re = Regex::new(r"^(\w+)\s+(.*)").ok()?;
+    let cap = re.captures(text)?;
     let name = cap.get(1)?.as_str().trim();
     let args = cap.get(2)?.as_str();
 
