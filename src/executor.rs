@@ -27,7 +27,10 @@ pub async fn execute_plan(
     let system = build_executor_system_prompt(&state.skills);
     let mut context = String::new();
 
+    // Phase A: Read
+    println!();
     for turn in 0..8 {
+        let spinner = spinner_for(&format!("Reading (turn {}/{})", turn + 1, 8));
         let messages = vec![
             Message { role: "system".into(), content: system.clone() },
             Message {
@@ -42,42 +45,75 @@ pub async fn execute_plan(
 
         let start = Instant::now();
         let response = api.chat(messages).await?;
+        spinner.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         if response.to_uppercase().contains("READY") {
+            print!("  {}  Context gathered ({}ms)", "✓".green(), start.elapsed().as_millis());
             break;
         }
 
         if let Some(tool) = parse_tool(&response) {
-            print!("  {}  {} ... ", "⚙".cyan().bold(), describe_tool(&tool));
+            print!("  {}  {} ... ", "⚙".cyan(), describe_tool(&tool));
             let result = execute_tool(&tool).await;
-            println!("{}", if result.success { "OK" } else { "FAILED" });
-            state.log(&format!("[{:?}] ({}ms)", tool, start.elapsed().as_millis()));
+            println!("{}  ({}ms)", if result.success { "OK".green() } else { "FAILED".red() }, start.elapsed().as_millis());
+            state.log(&format!("[{:?}]", tool));
             context.push_str(&format!("\n--- {} ---\n{}\n", describe_tool(&tool), result.output));
         }
     }
 
-    println!("\n  {}  Writing files...\n", "🔨".yellow().bold());
+    // Phase B: Write
+    println!();
+    let spinner = spinner_for("Implementing changes");
     let impl_messages = vec![
         Message { role: "system".into(), content: system.clone() },
         Message {
             role: "user".into(),
             content: format!(
                 "Task: {}\n\nPlan:\n{}\n\nContext:\n{}\n\n\
-                 Write ALL changed files using this format:\n\
-                 ===FILE path/to/file.ext\n\
-                 <complete file content>\n\
-                 ===END\n\
-                 Put ===RUN commands for tests. Output DONE when finished.",
+                 Write ALL files. Format:\n===FILE path\n<content>\n===END\n\
+                 Run tests with: ===RUN cmd\nOutput DONE when done.",
                 state.prompt, state.plan, context
             ),
         },
     ];
 
     let implementation = api.chat(impl_messages).await?;
+    spinner.store(true, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    println!();
+
     apply_implementation(state, &implementation)?;
     run_verification(state, &implementation)?;
     state.log("Done");
     Ok(())
+}
+
+fn spinner_for(label: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let done = Arc::new(AtomicBool::new(false));
+    let d = done.clone();
+    let l = label.to_string();
+
+    std::thread::spawn(move || {
+        let mut i = 0;
+        let mut stderr = std::io::stderr();
+        while !d.load(Ordering::Relaxed) {
+            let _ = write!(stderr, "\r  {}  {}", chars[i % chars.len()].yellow(), l);
+            let _ = stderr.flush();
+            std::thread::sleep(Duration::from_millis(120));
+            i += 1;
+        }
+        let _ = write!(stderr, "\r{}\r", " ".repeat(l.len() + 6));
+        let _ = stderr.flush();
+    });
+
+    done
 }
 
 fn build_executor_system_prompt(skills: &[crate::skills::Skill]) -> String {
