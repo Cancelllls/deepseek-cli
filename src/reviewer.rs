@@ -6,10 +6,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use std::io::{self, Write};
 
-pub async fn review_and_suggest(
-    api: &ApiClient,
-    state: &WorkflowState,
-) -> Result<String> {
+pub async fn review_and_suggest(api: &ApiClient, state: &WorkflowState) -> Result<String> {
     let messages = vec![Message {
         role: "user".into(),
         content: format!(
@@ -42,10 +39,7 @@ pub async fn review_and_suggest(
     Ok(suggestions)
 }
 
-pub async fn apply_optimizations(
-    api: &ApiClient,
-    state: &mut WorkflowState,
-) -> Result<()> {
+pub async fn apply_optimizations(api: &ApiClient, state: &mut WorkflowState) -> Result<()> {
     let original_prompt = state.prompt.clone();
     let original_plan = state.plan.clone();
     let suggestions = state.suggestions.clone();
@@ -59,7 +53,9 @@ pub async fn apply_optimizations(
          When done, reply ALL_DONE.",
         original_prompt, suggestions
     );
-    state.plan = "Apply each suggested improvement one by one. Read files, write changes, run tests.".to_string();
+    state.plan =
+        "Apply each suggested improvement one by one. Read files, write changes, run tests."
+            .to_string();
     state.execution_log.clear();
     state.error_count = 0;
 

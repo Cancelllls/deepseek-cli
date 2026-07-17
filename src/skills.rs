@@ -12,7 +12,9 @@ pub struct Skill {
 impl Skill {
     pub fn matches(&self, text: &str) -> bool {
         let lower = text.to_lowercase();
-        self.keywords.iter().any(|k| lower.contains(&k.to_lowercase()))
+        self.keywords
+            .iter()
+            .any(|k| lower.contains(&k.to_lowercase()))
     }
 
     pub fn instruction_body(&self) -> String {

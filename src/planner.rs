@@ -104,8 +104,14 @@ pub fn gather_project_context() -> String {
 
     // Key files
     let key_files = [
-        "Cargo.toml", "package.json", "go.mod", "requirements.txt",
-        "pyproject.toml", "Makefile", "Dockerfile", "tsconfig.json",
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "requirements.txt",
+        "pyproject.toml",
+        "Makefile",
+        "Dockerfile",
+        "tsconfig.json",
     ];
     ctx.push_str("\nKey files found:\n");
     for f in &key_files {

@@ -44,8 +44,7 @@ impl Config {
         if config_path.exists() {
             let content =
                 std::fs::read_to_string(&config_path).context("failed to read config file")?;
-            let config: Config =
-                toml::from_str(&content).context("failed to parse config file")?;
+            let config: Config = toml::from_str(&content).context("failed to parse config file")?;
             return Ok(config);
         }
 

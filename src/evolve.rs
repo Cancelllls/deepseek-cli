@@ -18,7 +18,11 @@ pub async fn rebuild_and_reinstall() -> Result<String> {
 
     if !status.status.success() {
         let stderr = String::from_utf8_lossy(&status.stderr);
-        output.push_str(&format!("\n  {}  BUILD FAILED:\n{}\n", "✗".red_term(), stderr));
+        output.push_str(&format!(
+            "\n  {}  BUILD FAILED:\n{}\n",
+            "✗".red_term(),
+            stderr
+        ));
         return Ok(output);
     }
     output.push_str("OK\n");
@@ -32,7 +36,11 @@ pub async fn rebuild_and_reinstall() -> Result<String> {
 
     if !status.status.success() {
         let stderr = String::from_utf8_lossy(&status.stderr);
-        output.push_str(&format!("\n  {}  CHECK FAILED:\n{}\n", "✗".red_term(), stderr));
+        output.push_str(&format!(
+            "\n  {}  CHECK FAILED:\n{}\n",
+            "✗".red_term(),
+            stderr
+        ));
         return Ok(output);
     }
     output.push_str("OK\n");
@@ -46,7 +54,11 @@ pub async fn rebuild_and_reinstall() -> Result<String> {
 
     if !status.status.success() {
         let stderr = String::from_utf8_lossy(&status.stderr);
-        output.push_str(&format!("\n  {}  INSTALL FAILED:\n{}\n", "✗".red_term(), stderr));
+        output.push_str(&format!(
+            "\n  {}  INSTALL FAILED:\n{}\n",
+            "✗".red_term(),
+            stderr
+        ));
         return Ok(output);
     }
     output.push_str("OK (binary at ~/.cargo/bin/deepseek-cli)\n");
@@ -61,13 +73,7 @@ pub fn run_diagnostics() -> String {
     // Clippy warnings
     out.push_str("  Running cargo clippy ...\n");
     if let Ok(status) = Command::new("cargo")
-        .args([
-            "clippy",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ])
+        .args(["clippy", "--all-targets", "--", "-D", "warnings"])
         .current_dir(src)
         .output()
     {
@@ -83,10 +89,7 @@ pub fn run_diagnostics() -> String {
             if lines.is_empty() {
                 out.push_str("  ✓  No issues detected\n");
             } else {
-                out.push_str(&format!(
-                    "  ⚠  {} warnings found:\n",
-                    lines.len()
-                ));
+                out.push_str(&format!("  ⚠  {} warnings found:\n", lines.len()));
                 for line in lines {
                     out.push_str(&format!("    {}\n", line.trim()));
                 }
@@ -155,9 +158,7 @@ pub fn auto_format() -> String {
         .current_dir(src)
         .output()
     {
-        Ok(status) if status.status.success() => {
-            "  ✓  Code formatted".to_string()
-        }
+        Ok(status) if status.status.success() => "  ✓  Code formatted".to_string(),
         Ok(status) => {
             format!(
                 "  ✗  Format failed: {}",

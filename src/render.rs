@@ -11,10 +11,7 @@ pub fn print_banner() {
         "⟡".bright_blue().bold(),
         "DeepSeek CLI".bright_blue().bold()
     );
-    println!(
-        "  {}",
-        "Autonomous Code Agent".dimmed()
-    );
+    println!("  {}", "Autonomous Code Agent".dimmed());
     println!();
 }
 
@@ -38,7 +35,10 @@ pub fn print_plan_summary(plan: &str) {
 
 pub fn print_suggestions(suggestions: &str) {
     println!();
-    println!("{}", "┌─ SUGGESTED IMPROVEMENTS ────────────".yellow().bold());
+    println!(
+        "{}",
+        "┌─ SUGGESTED IMPROVEMENTS ────────────".yellow().bold()
+    );
     for line in suggestions.lines() {
         if line.trim().is_empty() {
             println!("{}", "│".yellow().dimmed());
@@ -47,12 +47,19 @@ pub fn print_suggestions(suggestions: &str) {
         } else if line.to_uppercase().contains("OPTIMIZ") {
             println!("{} {}", "│".yellow().dimmed(), line.trim().yellow().bold());
         } else if line.trim().starts_with(|c: char| c.is_ascii_digit()) {
-            println!("{} {}", "│".yellow().dimmed(), line.trim().bright_white().bold());
+            println!(
+                "{} {}",
+                "│".yellow().dimmed(),
+                line.trim().bright_white().bold()
+            );
         } else {
             println!("{} {}", "│".yellow().dimmed(), line.trim().white());
         }
     }
-    println!("{}", "└────────────────────────────────────".yellow().bold());
+    println!(
+        "{}",
+        "└────────────────────────────────────".yellow().bold()
+    );
     println!();
 }
 
@@ -80,7 +87,8 @@ pub fn print_code_block(language: &str, code: &str) {
 pub fn print_token_counter(tokens_in: u64, tokens_out: u64) {
     let cost_per_m_in = 0.27;
     let cost_per_m_out = 1.10;
-    let cost = (tokens_in as f64 * cost_per_m_in + tokens_out as f64 * cost_per_m_out) / 1_000_000.0;
+    let cost =
+        (tokens_in as f64 * cost_per_m_in + tokens_out as f64 * cost_per_m_out) / 1_000_000.0;
 
     println!(
         "  {}  Tokens: {} in + {} out | Est. cost: ${:.4}",

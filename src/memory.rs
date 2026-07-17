@@ -76,13 +76,9 @@ pub fn load_journals() -> Vec<String> {
     if let Ok(entries_iter) = std::fs::read_dir(&dir) {
         for entry in entries_iter.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "md") {
+            if path.extension().is_some_and(|e| e == "md") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    let summary: String = content
-                        .lines()
-                        .take(8)
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let summary: String = content.lines().take(8).collect::<Vec<_>>().join("\n");
                     entries.push(summary);
                 }
             }
@@ -127,10 +123,7 @@ pub fn git_context() -> String {
     }
 
     // Uncommitted changes
-    if let Ok(output) = Command::new("git")
-        .args(["status", "--short"])
-        .output()
-    {
+    if let Ok(output) = Command::new("git").args(["status", "--short"]).output() {
         if output.status.success() {
             let status = String::from_utf8_lossy(&output.stdout);
             if !status.trim().is_empty() {

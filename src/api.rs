@@ -64,10 +64,7 @@ impl ApiClient {
         Ok(Self { config, client })
     }
 
-    pub fn stream_chat(
-        &self,
-        messages: Vec<Message>,
-    ) -> impl Stream<Item = StreamEvent> + '_ {
+    pub fn stream_chat(&self, messages: Vec<Message>) -> impl Stream<Item = StreamEvent> + '_ {
         let config = self.config.clone();
         let client = self.client.clone();
 

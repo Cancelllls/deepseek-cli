@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "  {}  {}  |  {}  |  {}",
         "⟡".bright_blue().bold(),
-        format!("{}", cfg.model).cyan(),
+        cfg.model.to_string().cyan(),
         "Type /help for commands, /exit to quit".dimmed(),
         if cfg.model == "deepseek-chat" {
             "reasoning: auto".dimmed().to_string()
@@ -177,7 +177,7 @@ async fn interactive_loop(
                 continue;
             }
             s if s.starts_with("/evolve ") => {
-                let rest = s.splitn(2, ' ').nth(1).unwrap_or("");
+                let rest = s.split_once(' ').map(|x| x.1).unwrap_or("");
                 evolve_dispatch_with(api, max_retries, bare, rest).await;
                 continue;
             }
@@ -262,8 +262,12 @@ async fn run_task(
     state.transition(Phase::Done);
     if !bare {
         let journal = memory::save_journal(
-            prompt, &state.plan, &state.execution_log, &state.suggestions,
-        ).unwrap_or_default();
+            prompt,
+            &state.plan,
+            &state.execution_log,
+            &state.suggestions,
+        )
+        .unwrap_or_default();
         if !journal.is_empty() {
             println!("  {}  .deepseek/journal/{}", "📓".dimmed(), journal);
         }
@@ -282,7 +286,10 @@ async fn run_task(
     }
 
     println!();
-    println!("  {}  Done. Type another task or /exit", "🎯".green().bold());
+    println!(
+        "  {}  Done. Type another task or /exit",
+        "🎯".green().bold()
+    );
     Ok(())
 }
 
@@ -318,7 +325,10 @@ fn current_branch() -> String {
 fn show_memory() {
     let mem = memory::load_memory();
     if mem.is_empty() {
-        println!("\n  {}  No memory yet. It builds up as you run tasks.\n", "📝".dimmed());
+        println!(
+            "\n  {}  No memory yet. It builds up as you run tasks.\n",
+            "📝".dimmed()
+        );
         return;
     }
     println!();
@@ -379,16 +389,30 @@ async fn evolve_dispatch(_api: &api::ApiClient, _max_retries: u32, _bare: bool) 
         evolve::source_path().dimmed()
     );
     println!();
-    println!("  {:<22} {}", "/evolve check".cyan(), "Diagnostics (clippy, fmt, deps, size)");
-    println!("  {:<22} {}", "/evolve fmt".cyan(), "Auto-format with cargo fmt + rebuild");
-    println!("  {:<22} {}", "/evolve fix".cyan(), "Auto-fix clippy warnings + rebuild");
-    println!("  {:<22} {}", "/evolve strip".cyan(), "Strip debug symbols");
-    println!("  {:<22} {}", "/evolve upgrade".cyan(), "Update deps + rebuild");
-    println!("  {:<22} {}", "/evolve build".cyan(), "Rebuild and reinstall");
     println!(
-        "  {:<22} {}",
-        "/evolve <task>".cyan(),
-        "AI-powered modification (needs API key)"
+        "  {:<22} Diagnostics (clippy, fmt, deps, size)",
+        "/evolve check".cyan()
+    );
+    println!(
+        "  {:<22} Auto-format with cargo fmt + rebuild",
+        "/evolve fmt".cyan()
+    );
+    println!(
+        "  {:<22} Auto-fix clippy warnings + rebuild",
+        "/evolve fix".cyan()
+    );
+    println!("  {:<22} Strip debug symbols", "/evolve strip".cyan());
+    println!(
+        "  {:<22} Update deps + rebuild",
+        "/evolve upgrade".cyan()
+    );
+    println!(
+        "  {:<22} Rebuild and reinstall",
+        "/evolve build".cyan()
+    );
+    println!(
+        "  {:<22} AI-powered modification (needs API key)",
+        "/evolve <task>".cyan()
     );
     println!();
 }
@@ -431,11 +455,7 @@ async fn evolve_dispatch_with(
                     if out.status.success() {
                         println!("  {}  Dependencies updated", "✓".green());
                     } else {
-                        println!(
-                            "  {}  {}",
-                            "✗".red(),
-                            String::from_utf8_lossy(&out.stderr)
-                        );
+                        println!("  {}  {}", "✗".red(), String::from_utf8_lossy(&out.stderr));
                     }
                 }
                 Err(e) => println!("  {}  {}", "✗".red(), e),
@@ -476,21 +496,18 @@ fn print_help() {
         "→".dimmed()
     );
     println!();
-    println!("  {:<20} {}", "/help, /h".cyan(), "Show this help");
-    println!("  {:<20} {}", "/exit, /q".cyan(), "Exit session");
-    println!("  {:<20} {}", "/clear, /c".cyan(), "Clear screen");
-    println!("  {:<20} {}", "/memory, /m".cyan(), "View project memory");
-    println!("  {:<20} {}", "/git, /g".cyan(), "View git context");
-    println!("  {:<20} {}", "/remember".cyan(), "Add manual memory entry");
-    println!("  {:<20} {}", "/evolve".cyan(), "Self-improvement menu");
+    println!("  {:<20} Show this help", "/help, /h".cyan());
+    println!("  {:<20} Exit session", "/exit, /q".cyan());
+    println!("  {:<20} Clear screen", "/clear, /c".cyan());
+    println!("  {:<20} View project memory", "/memory, /m".cyan());
+    println!("  {:<20} View git context", "/git, /g".cyan());
+    println!("  {:<20} Add manual memory entry", "/remember".cyan());
+    println!("  {:<20} Self-improvement menu", "/evolve".cyan());
     println!();
-    println!(
-        "{}",
-        "  Flags".bright_white().bold().underline()
-    );
-    println!("  {:<20} {}", "-p <task>".cyan(), "One-shot task (no REPL)");
-    println!("  {:<20} {}", "--yes".cyan(), "Skip all confirmations");
-    println!("  {:<20} {}", "--model <name>".cyan(), "Override model");
-    println!("  {:<20} {}", "--bare".cyan(), "Skip memory + git");
+    println!("{}", "  Flags".bright_white().bold().underline());
+    println!("  {:<20} One-shot task (no REPL)", "-p <task>".cyan());
+    println!("  {:<20} Skip all confirmations", "--yes".cyan());
+    println!("  {:<20} Override model", "--model <name>".cyan());
+    println!("  {:<20} Skip memory + git", "--bare".cyan());
     println!();
 }
