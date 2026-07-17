@@ -206,9 +206,13 @@ fn apply_implementation(state: &mut WorkflowState, response: &str) -> Result<()>
 }
 
 fn run_verification(state: &mut WorkflowState, response: &str) -> Result<()> {
-    let run_re = Regex::new(r"===RUN\s+(.+)").unwrap();
+    let run_re = Regex::new(r"===RUN\s+(.+?)(?:\n|$)").unwrap();
     for cap in run_re.captures_iter(response) {
         let cmd = cap.get(1).unwrap().as_str().trim();
+        // Skip if it's a delimiter keyword
+        if cmd == "END" || cmd == "FILE" || cmd == "RUN" || cmd.is_empty() {
+            continue;
+        }
         print!("  {}  {}", "▶".yellow().bold(), cmd.dimmed());
         match Command::new("sh").arg("-c").arg(cmd).output() {
             Ok(out) => {
