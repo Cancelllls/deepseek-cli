@@ -167,6 +167,12 @@ fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize>
             continue;
         }
 
+        // NEVER write to our own source files
+        if is_self_source(maybe_path) {
+            println!("  {}  {} (self-protected)", "🛡".bright_blue(), maybe_path.dimmed());
+            continue;
+        }
+
         // Reject content that looks like system prompt / instructions
         let content_preview = content.trim().chars().take(100).collect::<String>().to_lowercase();
         if content_preview.contains("write real code")
@@ -208,6 +214,11 @@ fn run_bash_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
             // Strip shell prompt prefixes
             let cmd = line.strip_prefix("$ ").or(line.strip_prefix("> ")).unwrap_or(line);
 
+            if should_skip_command(cmd) {
+                println!("  {}  {} (skipped — unsafe)", "⊘".yellow(), cmd.dimmed());
+                continue;
+            }
+
             print!("  {}  {}", "▶".yellow(), cmd.dimmed());
             let _ = std::io::stdout().flush();
 
@@ -234,4 +245,39 @@ fn run_bash_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
     }
 
     Ok(count)
+}
+
+fn is_self_source(path: &str) -> bool {
+    let files = [
+        "src/main.rs", "src/api.rs", "src/config.rs", "src/state.rs",
+        "src/planner.rs", "src/executor.rs", "src/reviewer.rs",
+        "src/render.rs", "src/skills.rs", "src/skills_data.rs",
+        "src/memory.rs", "src/evolve.rs", "Cargo.toml", "Cargo.lock",
+    ];
+    files.iter().any(|f| path == *f)
+}
+
+fn should_skip_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    if lower.contains("cargo test") && lower.contains("--test") {
+        if let Some(name) = cmd.split_whitespace()
+            .skip_while(|w| *w != "--test")
+            .nth(1)
+        {
+            if !std::path::Path::new(&format!("tests/{}.rs", name)).exists() {
+                return true;
+            }
+        }
+    }
+    if (lower.starts_with("npm ") || lower.starts_with("npx ") || lower.starts_with("node "))
+        && !std::path::Path::new("package.json").exists()
+    {
+        return true;
+    }
+    if lower.starts_with("pip ") && !std::path::Path::new("requirements.txt").exists()
+        && !std::path::Path::new("pyproject.toml").exists()
+    {
+        return true;
+    }
+    false
 }
