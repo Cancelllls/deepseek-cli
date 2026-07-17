@@ -1,27 +1,22 @@
-pub struct Config {
-    pub api_key: String,
-    pub model: String,
+pub mod workspace;
+pub mod tools;
+pub mod verifier;
+pub mod display;
+pub mod session;
+pub mod router;
+pub mod recovery;
+
+pub fn add(left: u64, right: u64) -> u64 {
+    left + right
 }
 
-impl Config {
-    pub fn new(api_key: &str, model: &str) -> Result<Self, &'static str> {
-        if api_key.is_empty() {
-            return Err("API key cannot be empty");
-        }
-        if model.is_empty() {
-            return("Model cannot be empty");
-        }
-        Ok(Config {
-            api_key: api_key.to_string(),
-            model: model.to_string(),
-        })
-    }
-}
+#[cfg(test)]
+mod {
+    use super::*;
 
-pub fn run_query(config: &Config,: &str) -> Result<String, &'static str> {
-    if prompt.trim().is_empty() {
-        return Err("Prompt cannot be empty");
+    #[test]
+    fn it_works() {
+        let result = add(2, 2);
+        assert_eq!(result, 4);
     }
-    // Placeholder for actual API call
-    Ok(format!("Response to '{}' using model {} with key {}", prompt, config.model, config.api_key))
 }
