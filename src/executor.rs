@@ -28,6 +28,8 @@ pub async fn execute_plan(
     state: &mut WorkflowState,
 ) -> Result<()> {
     let system = build_executor_system_prompt(&state.skills);
+    let mut consecutive_no_tool = 0u32;
+    let mut conversation: Vec<Message> = Vec::new();
 
     loop {
         let mut messages: Vec<Message> = vec![Message {
@@ -38,20 +40,21 @@ pub async fn execute_plan(
         messages.push(Message {
             role: "user".into(),
             content: format!(
-                "## Task\n{}\n\n## Plan\n{}\n\nExecute the next step of the plan. \
-                 Use tools to read files, write code, and run commands. \
-                 After each tool call, wait for the result before continuing. \
-                 When the task is fully complete, respond with 'ALL_DONE'.",
+                "## Task\n{}\n\n## Plan\n{}\n\n\
+                 Execute ONE step. Use a TOOL: call. Reply ALL_DONE when complete.",
                 state.prompt, state.plan
             ),
         });
 
-        // Include execution log for context
-        if !state.execution_log.is_empty() {
-            let recent: String = state.execution_log.iter().rev().take(5).rev().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
+        // Include recent conversation context
+        for msg in conversation.iter().rev().take(4) {
+            messages.push(msg.clone());
+        }
+
+        if consecutive_no_tool > 0 {
             messages.push(Message {
                 role: "user".into(),
-                content: format!("Recent execution log:\n{}", recent),
+                content: "You MUST use a TOOL: call right now. Do not describe — act.".into(),
             });
         }
 
@@ -64,6 +67,12 @@ pub async fn execute_plan(
         }
 
         if let Some(tool) = parse_tool_call(&response) {
+            consecutive_no_tool = 0;
+            conversation.push(Message {
+                role: "assistant".into(),
+                content: response.clone(),
+            });
+
             print!("  {}  {} ... ", "⚙".cyan().bold(), describe_tool(&tool));
             let result = execute_tool(&tool).await;
             let success = result.success;
@@ -76,19 +85,28 @@ pub async fn execute_plan(
             }
 
             state.log(&format!(
-                "[{:?}] {} → {} ({}ms)",
+                "[{:?}] → {} ({}ms)\n{}",
                 tool,
                 if success { "OK" } else { "FAIL" },
-                result.output.chars().take(200).collect::<String>(),
-                start.elapsed().as_millis()
+                start.elapsed().as_millis(),
+                result.output.chars().take(300).collect::<String>()
             ));
+
+            conversation.push(Message {
+                role: "user".into(),
+                content: format!(
+                    "Result of tool {}: {}",
+                    if success { "OK" } else { "FAILED" },
+                    result.output
+                ),
+            });
 
             if !success {
                 if state.error_count >= state.max_retries {
                     anyhow::bail!(
-                        "Too many failures ({}). Last error: {}",
+                        "Too many failures ({}). Last: {}",
                         state.error_count,
-                        result.output
+                        result.output.chars().take(200).collect::<String>()
                     );
                 }
                 println!(
@@ -100,12 +118,32 @@ pub async fn execute_plan(
                 state.transition(Phase::SelfHealing);
                 let fix = attempt_fix(api, state, &result).await?;
                 state.transition(Phase::Executing);
-                state.log(&format!("Auto-fix applied: {}", fix));
+                state.log(&format!("Auto-fix: {}", fix));
             }
         } else {
-            state.log(&format!("Response (no tool): {}", response));
-            println!("  {}  {}", "→".dimmed(), response.chars().take(200).collect::<String>().dimmed());
-            return Ok(());
+            consecutive_no_tool += 1;
+            conversation.push(Message {
+                role: "assistant".into(),
+                content: response.clone(),
+            });
+            state.log(&format!(
+                "Response (no tool, attempt {}): {}",
+                consecutive_no_tool,
+                response.chars().take(150).collect::<String>()
+            ));
+            println!(
+                "  {}  No tool in response (retry {}/3)",
+                "→".dimmed(),
+                consecutive_no_tool
+            );
+
+            if consecutive_no_tool >= 3 {
+                anyhow::bail!(
+                    "Model stopped producing tool calls after 3 attempts. Last response: {}",
+                    response.chars().take(200).collect::<String>()
+                );
+            }
+            // Loop continues — model gets another chance with stronger nudge
         }
     }
 }
@@ -115,24 +153,24 @@ fn build_executor_system_prompt(skills: &[crate::skills::Skill]) -> String {
 
     format!(
         "{}\n\n\
-         You are executing a plan step by step. Use the following tools:\n\n\
-         ## Tools\n\n\
-         To call a tool, use this exact format:\n\
+         ## Critical Rules for Tool Usage\n\n\
+         You MUST use tools for EVERY action. Never describe what you will do — DO it.\n\n\
+         Available tools:\n\n\
          ```\n\
          TOOL: read_file path=\"relative/path\"\n\
          TOOL: write_file path=\"relative/path\"\n\
-         content here...\n\
-         /TOOL\n\
-         TOOL: run_command cmd=\"command to run\"\n\
-         TOOL: search_code pattern=\"regex pattern\"\n\
+         <file content on next lines>\n\
+         TOOL: run_command cmd=\"shell command\"\n\
+         TOOL: search_code pattern=\"regex\"\n\
          TOOL: list_dir path=\"relative/path\"\n\
          ```\n\n\
-         - Call ONE tool at a time\n\
-         - After receiving a tool result, use it to decide the next action\n\
-         - When the entire task is complete, reply ONLY: ALL_DONE\n\
-         - If a command fails, analyze the error and try to fix it\n\
-         - IMPORTANT: actually create/modify files, don't just describe what to do\n\n\
-         Respond with a tool call OR ALL_DONE. Nothing else.",
+         Rules:\n\
+         - ONE tool per response. No text before or after.\n\
+         - For write_file: first line is TOOL, remaining lines are file content.\n\
+         - Reply ALL_DONE ONLY when every task step is complete.\n\
+         - Do NOT describe tools — USE them.\n\
+         - If you need to see a file, use read_file. If you need to change it, use write_file.\n\
+         - Never say you will read something — just read it.",
         base
     )
 }
