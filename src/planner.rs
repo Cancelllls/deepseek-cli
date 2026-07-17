@@ -6,13 +6,18 @@ use anyhow::Result;
 pub async fn generate_plan(
     api: &ApiClient,
     state: &mut WorkflowState,
+    context: &str,
 ) -> Result<String> {
-    let system = skills::build_system_prompt(&state.skills, &gather_project_context());
+    let mut base = skills::build_system_prompt(&state.skills, &gather_project_context());
+    if !context.is_empty() {
+        base.push_str("\n\n## Historical Context\n\n");
+        base.push_str(context);
+    }
 
     let mut messages: Vec<Message> = vec![
         Message {
             role: "system".into(),
-            content: system,
+            content: base,
         },
     ];
 

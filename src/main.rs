@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod executor;
+mod memory;
 mod planner;
 mod render;
 mod reviewer;
@@ -31,7 +32,7 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    /// Skip project context gathering
+    /// Skip project context and memory loading
     #[arg(long)]
     bare: bool,
 }
@@ -52,12 +53,37 @@ async fn main() -> anyhow::Result<()> {
         "Type /help for commands, /exit to quit".dimmed()
     );
 
+    if !args.bare {
+        let mem = memory::load_memory();
+        if !mem.is_empty() {
+            println!(
+                "  {}  Memory loaded ({} bytes) | Journal: {} entries",
+                "📝".dimmed(),
+                mem.len(),
+                memory::load_journals().len()
+            );
+        }
+
+        if is_git_repo() {
+            let branch = current_branch();
+            println!(
+                "  {}  Git repo detected {}",
+                "🔀".dimmed(),
+                if !branch.is_empty() {
+                    format!("(branch: {})", branch)
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+
     let api = api::ApiClient::new(cfg)?;
 
     if let Some(prompt) = args.prompt {
-        run_task(&api, &prompt, args.yes, args.max_retries).await?;
+        run_task(&api, &prompt, args.yes, args.max_retries, args.bare).await?;
     } else {
-        interactive_loop(&api, args.yes, args.max_retries).await?;
+        interactive_loop(&api, args.yes, args.max_retries, args.bare).await?;
     }
 
     Ok(())
@@ -67,6 +93,7 @@ async fn interactive_loop(
     api: &api::ApiClient,
     auto_yes: bool,
     max_retries: u32,
+    bare: bool,
 ) -> anyhow::Result<()> {
     loop {
         print!("\n  {}  ", "⟡".bright_blue().bold());
@@ -95,15 +122,31 @@ async fn interactive_loop(
                 render::print_banner();
                 continue;
             }
+            "/memory" | "/m" => {
+                show_memory();
+                continue;
+            }
+            "/git" | "/g" => {
+                show_git();
+                continue;
+            }
+            "/remember" => {
+                prompt_memory();
+                continue;
+            }
             s if s.starts_with('/') => {
                 let cmd = s.trim_start_matches('/');
-                println!("  {}  Unknown command: /{}. Type /help for commands.", "✗".red(), cmd);
+                println!(
+                    "  {}  Unknown command: /{}. Type /help for commands.",
+                    "✗".red(),
+                    cmd
+                );
                 continue;
             }
             _ => {}
         }
 
-        if let Err(e) = run_task(api, &input, auto_yes, max_retries).await {
+        if let Err(e) = run_task(api, &input, auto_yes, max_retries, bare).await {
             println!("  {}  Error: {}", "✗".red().bold(), e);
         }
     }
@@ -115,6 +158,7 @@ async fn run_task(
     prompt: &str,
     auto_yes: bool,
     max_retries: u32,
+    bare: bool,
 ) -> anyhow::Result<()> {
     let matched_skills = skills::route_skills(prompt);
     render::print_skill_activation(&matched_skills);
@@ -122,10 +166,18 @@ async fn run_task(
     let mut state = WorkflowState::new(prompt.to_string(), matched_skills);
     state.max_retries = max_retries;
 
+    // Load context
+    let context = if bare {
+        String::new()
+    } else {
+        memory::full_context()
+    };
+    state.add_message("system", &context);
+
     // Phase 1: Planning
     state.transition(Phase::Planning);
     println!("\n  {}  Thinking...\n", "⟳".yellow().bold());
-    let plan = planner::generate_plan(api, &mut state).await?;
+    let plan = planner::generate_plan(api, &mut state, &context).await?;
     render::print_plan_summary(&plan);
 
     // Phase 2: Awaiting Approval
@@ -150,7 +202,6 @@ async fn run_task(
     // Phase 5: Awaiting optimization approval
     state.transition(Phase::AwaitingOptimizeApproval);
     if confirm("Apply these improvements?", auto_yes)? {
-        // Phase 6: Optimizing
         state.transition(Phase::Optimizing);
         println!();
         let result = reviewer::apply_optimizations(api, &state).await?;
@@ -162,12 +213,36 @@ async fn run_task(
         println!("  {}  Skipping optimizations.", "→".dimmed());
     }
 
+    // Save session artifacts
     state.transition(Phase::Done);
-    println!(
-        "\n  {}  Task complete.",
-        "🎯".green().bold()
-    );
+    if !bare {
+        let journal = memory::save_journal(
+            prompt,
+            &state.plan,
+            &state.execution_log,
+            &state.suggestions,
+        )
+        .unwrap_or_default();
+        if !journal.is_empty() {
+            println!("  {}  Journal saved: .deepseek/journal/{}", "📓".dimmed(), journal);
+        }
 
+        let plan_summary: String = state.plan.lines().take(3).collect::<Vec<_>>().join("; ");
+        let _ = memory::update_memory_after_run(prompt, &plan_summary, &state.suggestions);
+        println!("  {}  Memory updated", "🧠".dimmed());
+
+        if is_git_repo() {
+            match memory::git_commit(&format!(
+                "deepseek: {}",
+                prompt.chars().take(72).collect::<String>()
+            )) {
+                Ok(_) => println!("  {}  Changes committed to git", "🔀".dimmed()),
+                Err(e) => println!("  {}  Git: {}", "⚠".yellow(), e),
+            }
+        }
+    }
+
+    println!("\n  {}  Task complete.", "🎯".green().bold());
     Ok(())
 }
 
@@ -187,6 +262,75 @@ fn confirm(message: &str, auto_yes: bool) -> anyhow::Result<bool> {
     Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
 }
 
+fn is_git_repo() -> bool {
+    std::path::Path::new(".git").exists()
+}
+
+fn current_branch() -> String {
+    std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn show_memory() {
+    let mem = memory::load_memory();
+    if mem.is_empty() {
+        println!("\n  {}  No memory yet. It builds up as you run tasks.\n", "📝".dimmed());
+        return;
+    }
+    println!();
+    println!("{}", "┌─ PROJECT MEMORY ────────────────────".cyan().bold());
+    for line in mem.lines().take(40) {
+        println!("{} {}", "│".cyan().dimmed(), line);
+    }
+    if mem.lines().count() > 40 {
+        println!(
+            "{} {}",
+            "│".cyan().dimmed(),
+            format!(
+                "... and {} more lines (see .deepseek/MEMORY.md)",
+                mem.lines().count() - 40
+            )
+            .dimmed()
+        );
+    }
+    println!("{}", "└────────────────────────────────────".cyan().bold());
+    println!();
+}
+
+fn show_git() {
+    if !is_git_repo() {
+        println!("\n  {}  Not a git repository.\n", "📝".dimmed());
+        return;
+    }
+    let ctx = memory::git_context();
+    println!();
+    println!("{}", "┌─ GIT CONTEXT ───────────────────────".cyan().bold());
+    for line in ctx.lines() {
+        println!("{} {}", "│".cyan().dimmed(), line);
+    }
+    println!("{}", "└────────────────────────────────────".cyan().bold());
+    println!();
+}
+
+fn prompt_memory() {
+    println!("  {}  What should I remember about this project?", "🧠".cyan());
+    print!("  {}  ", "   ".cyan());
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_ok() && !input.trim().is_empty() {
+        let _ = memory::append_memory(&format!(
+            "## Manual entry — {}\n\n{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M"),
+            input.trim()
+        ));
+        println!("  {}  Saved to memory.", "✓".green());
+    }
+}
+
 fn print_help() {
     println!();
     println!(
@@ -202,24 +346,20 @@ fn print_help() {
         " ".dimmed()
     );
     println!();
-    println!("  {:<12} {}", "/help, /h".cyan(), "Show this help");
-    println!("  {:<12} {}", "/exit, /q".cyan(), "Exit the session");
-    println!("  {:<12} {}", "/clear, /c".cyan(), "Clear the screen");
+    println!("  {:<16} {}", "/help, /h".cyan(), "Show this help");
+    println!("  {:<16} {}", "/exit, /q".cyan(), "Exit the session");
+    println!("  {:<16} {}", "/clear, /c".cyan(), "Clear the screen");
+    println!("  {:<16} {}", "/memory, /m".cyan(), "View project memory");
+    println!("  {:<16} {}", "/git, /g".cyan(), "View git context");
+    println!("  {:<16} {}", "/remember".cyan(), "Add a manual memory entry");
     println!();
     println!(
         "  {}",
         "Flags (one-shot mode only)".bright_white().bold().underline()
     );
-    println!("  {:<12} {}", "--yes".cyan(), "Auto-approve all checkpoints");
-    println!(
-        "  {:<12} {}",
-        "--model".cyan(),
-        "Override the default model"
-    );
-    println!(
-        "  {:<12} {}",
-        "-p <task>".cyan(),
-        "Run a single task (no REPL)"
-    );
+    println!("  {:<16} {}", "--yes".cyan(), "Auto-approve all checkpoints");
+    println!("  {:<16} {}", "--model".cyan(), "Override the default model");
+    println!("  {:<16} {}", "-p <task>".cyan(), "Run a single task (no REPL)");
+    println!("  {:<16} {}", "--bare".cyan(), "Skip memory and git integration");
     println!();
 }
