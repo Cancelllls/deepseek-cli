@@ -35,8 +35,10 @@ pub async fn execute_plan(
 
     let mut total_files = 0u32;
     let max_turns = 12;
+    let mut actual_turns = 0u32;
 
     for turn in 1..=max_turns {
+        actual_turns = turn;
         eprint!("  {}  Turn {}/{}", "●".yellow(), turn, max_turns);
         let _ = std::io::stderr().flush();
 
@@ -52,9 +54,14 @@ pub async fn execute_plan(
             if response.to_uppercase().contains("DONE") {
                 break;
             }
+            // Strong nudge: show the exact format again
             conversation.push(Message {
                 role: "user".into(),
-                content: "Use XML tool tags:\n<read_file path=\"file\" />\n<write_file path=\"file\">code</write_file>\n<bash>command</bash>\n<list_dir path=\".\" />".into(),
+                content: "You must use tool calls. Do not describe tools — USE them. Examples:\n\
+                         <read_file path=\"src/main.rs\" />\n\
+                         <write_file path=\"src/hello.rs\">\nfn main() {{ println!(\"hi\"); }}\n</write_file>\n\
+                         <bash>cargo check</bash>\n\n\
+                         Respond with tool calls NOW. No explanations.".into(),
             });
             continue;
         }
@@ -63,21 +70,21 @@ pub async fn execute_plan(
         for tool in &tools {
             if matches!(tool, Tool::WriteFile { .. }) { total_files += 1; }
             match execute_tool(tool).await {
-                Ok(result) => results.push_str(&format!("\n--- {} RESULT ---\n{}\n", tool_name(tool), result)),
-                Err(e) => results.push_str(&format!("\n--- {} ERROR ---\n{}\n", tool_name(tool), e)),
+                Ok(result) => results.push_str(&format!("\n<ToolResult name=\"{}\">\n{}\n</ToolResult>", tool_name(tool), result)),
+                Err(e) => results.push_str(&format!("\n<ToolError name=\"{}\">\n{}\n</ToolError>", tool_name(tool), e)),
             }
         }
 
         if !results.is_empty() {
             conversation.push(Message {
                 role: "user".into(),
-                content: format!("Results:{}", results),
+                content: format!("Tool execution results. Continue with more tools, or say DONE.\n{}", results),
             });
         }
     }
 
     if total_files > 0 {
-        println!("  {}  {} files in {} turns", "✓".green().bold(), total_files, max_turns);
+        println!("  {}  {} files in {} turns", "✓".green().bold(), total_files, actual_turns);
     }
     state.log(&format!("{} files", total_files));
     Ok(())
@@ -86,15 +93,29 @@ pub async fn execute_plan(
 fn build_system(skills: &[crate::skills::Skill]) -> String {
     let base = skills::build_system_prompt(skills, "");
     format!(
-        "{}\n\nTOOLS (use XML tags):\n\
-         <read_file path=\"file.rs\" />\n\
-         <write_file path=\"file.rs\">\ncode here\n</write_file>\n\
-         <bash>cargo check</bash>\n\
-         <list_dir path=\".\" />\n\
-         <search pattern=\"keyword\" />\n\n\
-         Read first, then write. Write COMPLETE files.\n\
-         Reply DONE when finished.",
-        base
+        "{base}\n\n\
+         ## Available Tools\n\n\
+         You MUST use these XML tools for EVERY action. Never describe a tool — USE it.\n\n\
+         Read a file:\n\
+         <read_file path=\"relative/path.rs\" />\n\n\
+         Write/overwrite a file:\n\
+         <write_file path=\"relative/path.rs\">\n\
+         // complete file contents here\n\
+         </write_file>\n\n\
+         Run a shell command:\n\
+         <bash>cargo check</bash>\n\n\
+         List a directory:\n\
+         <list_dir path=\".\" />\n\n\
+         Search code:\n\
+         <search pattern=\"function_name\" />\n\n\
+         ## CRITICAL RULES\n\n\
+         1. Always respond with tool calls, never plain text describing what you will do.\n\
+         2. Use <write_file> exactly as shown — path attribute, then content between tags.\n\
+         3. Write COMPLETE files. Never use comments like '// rest of file unchanged'.\n\
+         4. Verify your work with <bash>cargo check</bash> after changes.\n\
+         5. When finished, include the word DONE in your final response.\n\
+         6. If a tool fails, read its error output. Fix the issue. Retry.\n\n\
+         Start working now."
     )
 }
 
