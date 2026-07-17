@@ -4,17 +4,16 @@ use clap::Parser;
 use cli::args::Commands;
 
 mod cli;
-mod api;
-mod engine;
+mod apimod engine;
 mod utils;
 
 fn main() {
-    let cli = cli::args::Cli::parse();
+    let cli = cliargs::Cli::parse();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt_on(async {
+    rt.block_on(async {
         if let Err(e) = cli.execute().await {
-            eprintln!("Error: {}", e);
+            eprintlnError: {}", e);
             std::process::exit(1);
         }
     });

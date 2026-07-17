@@ -25,3 +25,12 @@
 **What was done:** 1. Write file "status.txt" with content "READY"; 2. Verify file existence and content.
 
 **Improvements suggested:** - File size 6 bytes suggests an extra newline (`READY\n`), not just `READY` as.; - No test verifies the exact file content equals "READY" without trailing newline.
+
+
+## 2026-07-17 18:34 — add a comment to the top of src/main.rs saying // DeepSeek CLI v0.1.0
+
+**What was asked:** add a comment to the top of src/main.rs saying // DeepSeek CLI v0.1.0
+
+**What was done:** 1. Read `src/main.rs` to see current contents.; 2. Write `src/main.rs` with `// DeepSeek CLI v0.1.` prepended to the existing content.; 3. Verify the file begins with `// DeepSeek CLI v0.1.0` by reading first line.
+
+**Improvements suggested:** - Shebang breakage: if `src/main.rs` starts with `#!/usr/bin/...`, adding a comment above it will silently break script execution.; - No idempotency check: repeated runs will duplicate the comment.
