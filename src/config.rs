@@ -19,13 +19,13 @@ fn default_base_url() -> String {
     "https://api.deepseek.com".into()
 }
 fn default_model() -> String {
-    "deepseek-chat".into()
+    "deepseek-v4-pro".into()
 }
 fn default_max_tokens() -> u32 {
-    8192
+    65536
 }
 fn default_temperature() -> f32 {
-    0.7
+    0.0
 }
 
 impl Config {
