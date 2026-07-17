@@ -1,105 +1,184 @@
 use crate::api::{ApiClient, Message};
 use crate::skills;
-use crate::state::{Phase, WorkflowState};
+use crate::state::WorkflowState;
 use anyhow::Result;
 use colored::*;
 use regex::Regex;
+use std::io::Write;
 use std::process::Command;
-use std::time::Instant;
-
-#[derive(Debug)]
-enum ToolCall {
-    ReadFile { path: String },
-    RunCommand { cmd: String },
-    SearchCode { pattern: String },
-    ListDir { path: String },
-}
-
-struct ToolResult {
-    success: bool,
-    output: String,
-}
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub async fn execute_plan(
     api: &ApiClient,
     state: &mut WorkflowState,
 ) -> Result<()> {
-    let system = build_executor_system_prompt(&state.skills);
-    let mut context = String::new();
+    let context = build_context();
+    let system = build_system(&state.skills);
 
-    // Phase A: Read
     println!();
-    for turn in 0..8 {
-        let spinner = spinner_for(&format!("Reading (turn {}/{})", turn + 1, 8));
-        let messages = vec![
-            Message { role: "system".into(), content: system.clone() },
-            Message {
-                role: "user".into(),
-                content: format!(
-                    "Task: {}\n\nPlan:\n{}\n\nContext gathered:\n{}\n\n\
-                     Read files or run commands. Reply READY when done reading.",
-                    state.prompt, state.plan, context
-                ),
-            },
-        ];
+    let spinner = spinner("Implementing");
 
-        let start = Instant::now();
-        let response = api.chat(messages).await?;
-        spinner.store(true, std::sync::atomic::Ordering::Relaxed);
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        if response.to_uppercase().contains("READY") {
-            print!("  {}  Context gathered ({}ms)", "✓".green(), start.elapsed().as_millis());
-            break;
-        }
-
-        if let Some(tool) = parse_tool(&response) {
-            print!("  {}  {} ... ", "⚙".cyan(), describe_tool(&tool));
-            let result = execute_tool(&tool).await;
-            println!("{}  ({}ms)", if result.success { "OK".green() } else { "FAILED".red() }, start.elapsed().as_millis());
-            state.log(&format!("[{:?}]", tool));
-            context.push_str(&format!("\n--- {} ---\n{}\n", describe_tool(&tool), result.output));
-        }
-    }
-
-    // Phase B: Write
-    println!();
-    let spinner = spinner_for("Implementing changes");
-    let impl_messages = vec![
-        Message { role: "system".into(), content: system.clone() },
+    let messages = vec![
+        Message { role: "system".into(), content: system },
         Message {
             role: "user".into(),
             content: format!(
-                "Task: {}\n\nPlan:\n{}\n\nContext:\n{}\n\n\
-                 Write ALL files. Format:\n===FILE path\n<content>\n===END\n\
-                 Run tests with: ===RUN cmd\nOutput DONE when done.",
+                "## Task\n{}\n\n## Plan\n{}\n\n## Project Context\n{}\n\n\
+                 Implement ALL changes. For each file output:\n\
+                 ```lang:path/to/file\n<complete content>\n```\n\
+                 Verification as: ```bash\ncmd\n```\nReply DONE when done.",
                 state.prompt, state.plan, context
             ),
         },
     ];
 
-    let implementation = api.chat(impl_messages).await?;
-    spinner.store(true, std::sync::atomic::Ordering::Relaxed);
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    println!();
+    let implementation = api.chat(messages).await?;
+    spinner.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
-    apply_implementation(state, &implementation)?;
-    run_verification(state, &implementation)?;
+    let written = apply_file_blocks(state, &implementation)?;
+    let verified = run_bash_blocks(state, &implementation)?;
+
+    if written == 0 && verified == 0 {
+        println!("  {}  No changes detected", "→".dimmed());
+        apply_raw_response(state, &implementation)?;
+    } else {
+        println!("  {}  {} files, {} checks", "✓".green().bold(), written, verified);
+    }
+
     state.log("Done");
     Ok(())
 }
 
-fn spinner_for(label: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
+fn build_context() -> String {
+    let mut ctx = String::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        ctx.push_str(&format!("Working dir: {}\n\n", cwd.display()));
+    }
+    ctx.push_str("Project files:\n");
+    if let Ok(entries) = std::fs::read_dir(".") {
+        let mut items: Vec<String> = entries
+            .flatten()
+            .map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                format!("  {}{}", n, if d { "/" } else { "" })
+            })
+            .filter(|s| !s.contains("/.") && !s.contains("target") && !s.contains("node_modules"))
+            .collect();
+        items.sort();
+        for item in items.iter().take(50) {
+            ctx.push_str(&format!("{}\n", item));
+        }
+    }
+    for f in &["Cargo.toml", "package.json", "go.mod", "pyproject.toml"] {
+        if std::path::Path::new(f).exists() {
+            if let Ok(content) = std::fs::read_to_string(f) {
+                ctx.push_str(&format!("\n--- {} ---\n{}\n", f, content));
+            }
+        }
+    }
+    ctx
+}
 
+fn build_system(skills: &[crate::skills::Skill]) -> String {
+    let base = skills::build_system_prompt(skills, "");
+    format!(
+        "{}\n\nWrite files as:\n```lang:path/to/file\n<complete content>\n```\nCommands as:\n```bash\ncmd\n```",
+        base
+    )
+}
+
+fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
+    let re = Regex::new(r"```(?:[a-zA-Z0-9_+#-]+(?::| filename=| ))?(.+?)[\r\n]+([\s\S]*?)```").unwrap();
+    let mut count = 0;
+
+    for cap in re.captures_iter(response) {
+        let maybe_path = cap.get(1).unwrap().as_str().trim();
+        let content = cap.get(2).unwrap().as_str();
+
+        if maybe_path == "bash" || maybe_path == "sh" || maybe_path == "shell"
+            || maybe_path == "zsh" || maybe_path == "console" || maybe_path == "terminal"
+            || maybe_path.is_empty() || maybe_path == "text" || maybe_path == "plaintext"
+            || maybe_path.starts_with("write_file:") || maybe_path.starts_with("TOOL:")
+            || maybe_path.starts_with("read_file:") || maybe_path.starts_with("run_command:")
+        {
+            continue;
+        }
+
+        let is_path = maybe_path.contains('/') || maybe_path.contains(".rs")
+            || maybe_path.contains(".ts") || maybe_path.contains(".js")
+            || maybe_path.contains(".py") || maybe_path.contains(".go")
+            || maybe_path.contains(".toml") || maybe_path.contains(".json")
+            || maybe_path.contains(".yaml") || maybe_path.contains(".yml")
+            || maybe_path.contains(".md") || maybe_path.contains(".html")
+            || maybe_path.contains(".css") || maybe_path.contains(".sql")
+            || maybe_path.contains(".sh") || maybe_path.contains(".txt");
+
+        if !is_path || content.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(parent) = std::path::Path::new(maybe_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match std::fs::write(maybe_path, content) {
+            Ok(_) => {
+                println!("  {}  {}", "✓".green().bold(), maybe_path.cyan());
+                state.log(&format!("Wrote {}", maybe_path));
+                count += 1;
+            }
+            Err(e) => println!("  {}  {}: {}", "✗".red(), maybe_path, e),
+        }
+    }
+    Ok(count)
+}
+
+fn run_bash_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
+    let re = Regex::new(r"```(?:bash|sh|shell|zsh|console)\s*\n([\s\S]*?)```").unwrap();
+    let mut count = 0;
+    for cap in re.captures_iter(response) {
+        let script = cap.get(1).unwrap().as_str().trim();
+        for line in script.lines() {
+            let cmd = line.trim();
+            if cmd.is_empty() || cmd.starts_with('#') || cmd.starts_with("//") { continue; }
+            let actual = cmd.strip_prefix("$ ").or(cmd.strip_prefix("> ")).unwrap_or(cmd);
+            print!("  {}  {}", "▶".yellow().bold(), actual.dimmed());
+            match Command::new("sh").arg("-c").arg(actual).output() {
+                Ok(out) => {
+                    let ok = out.status.success();
+                    println!("  {}", if ok { "OK".green() } else { "FAILED".red() });
+                    if !ok {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        if !stderr.trim().is_empty() { println!("    {}", stderr.trim().red()); }
+                    }
+                    state.log(&format!("Ran `{}` → {}", actual, if ok { "OK" } else { "FAIL" }));
+                }
+                Err(e) => println!("  {}", format!("ERR: {}", e).red()),
+            }
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn apply_raw_response(state: &mut WorkflowState, response: &str) -> Result<()> {
+    if !response.contains("```") && response.len() > 50 {
+        let _ = std::fs::create_dir_all(".deepseek");
+        std::fs::write(".deepseek/raw_response.txt", response)?;
+        println!("  {}  Saved raw response", "📝".dimmed());
+    }
+    Ok(())
+}
+
+fn spinner(label: &str) -> Arc<AtomicBool> {
     let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let done = Arc::new(AtomicBool::new(false));
     let d = done.clone();
     let l = label.to_string();
-
     std::thread::spawn(move || {
         let mut i = 0;
         let mut stderr = std::io::stderr();
@@ -112,152 +191,5 @@ fn spinner_for(label: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         let _ = write!(stderr, "\r{}\r", " ".repeat(l.len() + 6));
         let _ = stderr.flush();
     });
-
     done
-}
-
-fn build_executor_system_prompt(skills: &[crate::skills::Skill]) -> String {
-    let base = skills::build_system_prompt(skills, "");
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-    format!(
-        "{}\n\nWorking dir: {}\n\nTools: TOOL: read_file | run_command | search_code | list_dir path=\"path\"\nWrite files with: ===FILE path ===END",
-        base, cwd
-    )
-}
-
-fn parse_tool(response: &str) -> Option<ToolCall> {
-    // Strip optional TOOL: prefix, match just the tool call
-    let text = response.trim();
-    let text = text.strip_prefix("TOOL:").unwrap_or(text).trim();
-
-    let re = Regex::new(r"^(\w+)\s+(.*)").ok()?;
-    let cap = re.captures(text)?;
-    let name = cap.get(1)?.as_str().trim();
-    let args = cap.get(2)?.as_str();
-
-    match name {
-        "read_file" => extract_quoted(args, "path").map(|path| ToolCall::ReadFile { path }),
-        "run_command" => extract_quoted(args, "cmd").map(|cmd| ToolCall::RunCommand { cmd }),
-        "search_code" => extract_quoted(args, "pattern").map(|pattern| ToolCall::SearchCode { pattern }),
-        "list_dir" => {
-            let path = extract_quoted(args, "path").unwrap_or_else(|| ".".into());
-            Some(ToolCall::ListDir { path })
-        }
-        _ => None,
-    }
-}
-
-fn extract_quoted(args: &str, key: &str) -> Option<String> {
-    let re = Regex::new(&format!(r#"{}\s*=\s*"([^"]*)""#, key)).ok()?;
-    re.captures(args)?.get(1).map(|m| m.as_str().to_string())
-}
-
-fn describe_tool(tool: &ToolCall) -> String {
-    match tool {
-        ToolCall::ReadFile { path } => format!("Reading {}", path),
-        ToolCall::RunCommand { cmd } => format!("Running: {}", cmd),
-        ToolCall::SearchCode { pattern } => format!("Searching: {}", pattern),
-        ToolCall::ListDir { path } => format!("Listing: {}", path),
-    }
-}
-
-async fn execute_tool(tool: &ToolCall) -> ToolResult {
-    match tool {
-        ToolCall::ReadFile { path } => {
-            match std::fs::read_to_string(path) {
-                Ok(content) => ToolResult { success: true, output: format!("{} ({} bytes):\n{}", path, content.len(), content) },
-                Err(e) => {
-                    let dir = std::path::Path::new(path).parent().unwrap_or(".".as_ref());
-                    let mut hint = format!("Error: {}\nFiles here:\n", e);
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let n = entry.file_name().to_string_lossy().to_string();
-                            if !n.starts_with('.') { hint.push_str(&format!("  {}\n", n)); }
-                        }
-                    }
-                    ToolResult { success: false, output: hint }
-                }
-            }
-        }
-        ToolCall::RunCommand { cmd } => {
-            match Command::new("sh").arg("-c").arg(cmd).output() {
-                Ok(out) => ToolResult {
-                    success: out.status.success(),
-                    output: format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
-                },
-                Err(e) => ToolResult { success: false, output: format!("Error: {}", e) },
-            }
-        }
-        ToolCall::SearchCode { pattern } => {
-            match Command::new("rg").arg("-n").arg("-i").arg("--no-heading").arg(pattern).output() {
-                Ok(out) => {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    let lines: Vec<&str> = text.lines().take(30).collect();
-                    ToolResult { success: true, output: if lines.is_empty() { format!("No matches for '{}'", pattern) } else { lines.join("\n") } }
-                }
-                Err(e) => ToolResult { success: false, output: format!("Search failed: {}", e) },
-            }
-        }
-        ToolCall::ListDir { path } => {
-            match std::fs::read_dir(path) {
-                Ok(entries) => {
-                    let mut items: Vec<String> = entries.flatten()
-                        .map(|e| {
-                            let n = e.file_name().to_string_lossy().to_string();
-                            let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                            format!("  {}{}", n, if d { "/" } else { "" })
-                        })
-                        .filter(|s| !s.contains("/."))
-                        .collect();
-                    items.sort();
-                    ToolResult { success: true, output: format!("{} contents:\n{}", path, items.join("\n")) }
-                }
-                Err(e) => ToolResult { success: false, output: format!("Error: {}", e) },
-            }
-        }
-    }
-}
-
-fn apply_implementation(state: &mut WorkflowState, response: &str) -> Result<()> {
-    let file_re = Regex::new(r"===FILE\s+(.+?)\n((?s).*?)===END").unwrap();
-    let mut count = 0;
-
-    for cap in file_re.captures_iter(response) {
-        let path = cap.get(1).unwrap().as_str().trim();
-        let content = cap.get(2).unwrap().as_str().trim();
-        if content.is_empty() { continue; }
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)?;
-        println!("  {}  {}", "✓".green().bold(), path.cyan());
-        state.log(&format!("Wrote {} ({} bytes)", path, content.len()));
-        count += 1;
-    }
-
-    if count == 0 {
-        println!("  {}  No ===FILE blocks found", "⚠".yellow());
-    }
-    Ok(())
-}
-
-fn run_verification(state: &mut WorkflowState, response: &str) -> Result<()> {
-    let run_re = Regex::new(r"===RUN\s+(.+?)(?:\n|$)").unwrap();
-    for cap in run_re.captures_iter(response) {
-        let cmd = cap.get(1).unwrap().as_str().trim();
-        // Skip if it's a delimiter keyword
-        if cmd == "END" || cmd == "FILE" || cmd == "RUN" || cmd.is_empty() {
-            continue;
-        }
-        print!("  {}  {}", "▶".yellow().bold(), cmd.dimmed());
-        match Command::new("sh").arg("-c").arg(cmd).output() {
-            Ok(out) => {
-                let ok = out.status.success();
-                println!("  {}", if ok { "OK".green() } else { "FAILED".red() });
-                state.log(&format!("===RUN {} → {}", cmd, if ok { "OK" } else { "FAIL" }));
-            }
-            Err(e) => println!("  {}", format!("ERR: {}", e).red()),
-        }
-    }
-    Ok(())
 }
