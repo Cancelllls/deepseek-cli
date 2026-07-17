@@ -60,20 +60,26 @@ pub async fn execute_plan(
 
     state.log("Implementation complete");
 
-    if std::path::Path::new("Cargo.toml").exists() {
+    if std::path::Path::new("Cargo.toml").exists() && written > 0 {
         print!("  {}  cargo check ", "▶".yellow());
         let _ = std::io::stdout().flush();
-        match Command::new("cargo").args(["check"]).output() {
+        match Command::new("cargo").args(["check", "--message-format=short"]).output() {
             Ok(out) => {
                 if out.status.success() {
                     println!("{}", "OK".green());
                 } else {
-                    println!("{}", "FAILED".red());
+                    println!("{}  — reverting changes", "FAILED".red());
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     for l in stderr.lines().take(5) {
                         if !l.trim().is_empty() { println!("    {}", l.trim().red()); }
                     }
-                    state.log("cargo check FAILED — project may be broken");
+                    // Revert via git if available
+                    if std::path::Path::new(".git").exists() {
+                        let _ = Command::new("git").args(["checkout", "--", "."]).output();
+                        let _ = Command::new("git").args(["clean", "-fd"]).output();
+                        println!("  {}  Changes reverted via git", "↩".cyan());
+                        state.log("Changes reverted — cargo check failed");
+                    }
                 }
             }
             Err(_) => {}
@@ -192,12 +198,6 @@ fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize>
             continue;
         }
 
-        // NEVER write to our own source files
-        if is_self_source(maybe_path) {
-            println!("  {}  {} (self-protected)", "🛡".bright_blue(), maybe_path.dimmed());
-            continue;
-        }
-
         // Reject content that looks like system prompt / instructions
         let content_preview = content.trim().chars().take(100).collect::<String>().to_lowercase();
         if content_preview.contains("write real code")
@@ -270,16 +270,6 @@ fn run_bash_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
     }
 
     Ok(count)
-}
-
-fn is_self_source(path: &str) -> bool {
-    let files = [
-        "src/main.rs", "src/api.rs", "src/config.rs", "src/state.rs",
-        "src/planner.rs", "src/executor.rs", "src/reviewer.rs",
-        "src/render.rs", "src/skills.rs", "src/skills_data.rs",
-        "src/memory.rs", "src/evolve.rs", "Cargo.toml", "Cargo.lock",
-    ];
-    files.iter().any(|f| path == *f)
 }
 
 fn should_skip_command(cmd: &str) -> bool {
