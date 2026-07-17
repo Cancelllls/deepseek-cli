@@ -1,7 +1,10 @@
+use crate::api;
 use crate::api::{ApiClient, Message};
 use crate::skills;
 use crate::state::WorkflowState;
 use anyhow::Result;
+use futures::StreamExt;
+use std::io::{self, Write};
 
 pub async fn generate_plan(
     api: &ApiClient,
@@ -36,7 +39,45 @@ pub async fn generate_plan(
         ),
     });
 
-    let plan = api.chat(messages).await?;
+#[allow(unused_imports)]
+use futures::StreamExt;
+    let mut stream = Box::pin(api.stream_chat(messages));
+    let mut plan = String::new();
+    let mut stderr = io::stderr();
+
+    print!("  ");
+    let _ = io::stdout().flush();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            api::StreamEvent::Content(text) => {
+                plan.push_str(&text);
+                // Stream visible output
+                if text.contains('\n') {
+                    let lines: Vec<&str> = text.split('\n').collect();
+                    for (i, chunk) in lines.iter().enumerate() {
+                        if i > 0 {
+                            eprint!("\n  ");
+                        }
+                        eprint!("{}", chunk);
+                    }
+                } else {
+                    eprint!("{}", text);
+                }
+                let _ = stderr.flush();
+            }
+            api::StreamEvent::Reasoning(text) => {
+                let _ = stderr.write_all(format!("\x1b[2m{}\x1b[0m", text).as_bytes());
+            }
+            api::StreamEvent::Done => break,
+            api::StreamEvent::Error(e) => {
+                eprintln!();
+                anyhow::bail!(e);
+            }
+        }
+    }
+    eprintln!();
+
     state.plan = plan.clone();
     state.add_message("assistant", &plan);
 

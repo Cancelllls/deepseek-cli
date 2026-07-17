@@ -11,31 +11,65 @@ mod state;
 
 use clap::Parser;
 use colored::*;
+use rustyline::error::ReadlineError;
+use rustyline::{DefaultEditor, Result as RlResult};
 use state::{Phase, WorkflowState};
 use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(name = "deepseek", about = "Autonomous DeepSeek coding agent")]
 struct Args {
-    /// The task to execute in one-shot mode (no REPL)
     #[arg(short = 'p', long)]
     prompt: Option<String>,
 
-    /// Auto-approve all phases (no user confirmation)
     #[arg(long)]
     yes: bool,
 
-    /// Maximum self-healing retry attempts
     #[arg(long, default_value = "3")]
     max_retries: u32,
 
-    /// DeepSeek model to use
     #[arg(long)]
     model: Option<String>,
 
-    /// Skip project context and memory loading
     #[arg(long)]
     bare: bool,
+}
+
+fn history_path() -> std::path::PathBuf {
+    config::Config::config_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("history")
+}
+
+fn create_editor() -> RlResult<DefaultEditor> {
+    let mut rl = DefaultEditor::new()?;
+    let _ = rl.load_history(&history_path());
+    Ok(rl)
+}
+
+fn read_line(rl: &mut DefaultEditor, prompt: &str) -> Option<String> {
+    match rl.readline(prompt) {
+        Ok(line) => {
+            let trimmed = line.trim().to_string();
+            if !trimmed.is_empty() {
+                let _ = rl.add_history_entry(&trimmed);
+            }
+            Some(trimmed)
+        }
+        Err(ReadlineError::Interrupted) => {
+            println!("^C");
+            None
+        }
+        Err(ReadlineError::Eof) => None,
+        Err(e) => {
+            eprintln!("  {}  Read error: {}", "✗".red(), e);
+            None
+        }
+    }
+}
+
+fn save_history(rl: &mut DefaultEditor) {
+    let _ = rl.save_history(&history_path());
 }
 
 #[tokio::main]
@@ -48,34 +82,32 @@ async fn main() -> anyhow::Result<()> {
         cfg.model = model.clone();
     }
     println!(
-        "  {}  {}  |  {}",
+        "  {}  {}  |  {}  |  {}",
         "⟡".bright_blue().bold(),
-        format!("Model: {}", cfg.model).cyan(),
-        "Type /help for commands, /exit to quit".dimmed()
+        format!("{}", cfg.model).cyan(),
+        "Type /help for commands, /exit to quit".dimmed(),
+        if cfg.model == "deepseek-chat" {
+            "reasoning: auto".dimmed().to_string()
+        } else {
+            String::new()
+        }
     );
 
     if !args.bare {
         let mem = memory::load_memory();
         if !mem.is_empty() {
             println!(
-                "  {}  Memory loaded ({} bytes) | Journal: {} entries",
+                "  {}  Memory: {} bytes | Journal: {} entries",
                 "📝".dimmed(),
                 mem.len(),
                 memory::load_journals().len()
             );
         }
-
         if is_git_repo() {
             let branch = current_branch();
-            println!(
-                "  {}  Git repo detected {}",
-                "🔀".dimmed(),
-                if !branch.is_empty() {
-                    format!("(branch: {})", branch)
-                } else {
-                    String::new()
-                }
-            );
+            if !branch.is_empty() {
+                println!("  {}  Git: {}", "🔀".dimmed(), branch.cyan());
+            }
         }
     }
 
@@ -96,13 +128,17 @@ async fn interactive_loop(
     max_retries: u32,
     bare: bool,
 ) -> anyhow::Result<()> {
-    loop {
-        print!("\n  {}  ", "⟡".bright_blue().bold());
-        io::stdout().flush()?;
+    let mut rl = create_editor()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim().to_string();
+    loop {
+        let input = match read_line(&mut rl, &format!("\n  {}  ", "⟡".bright_blue().bold())) {
+            Some(line) => line,
+            None => {
+                save_history(&mut rl);
+                println!("\n  {}  Goodbye.", "👋".dimmed());
+                break;
+            }
+        };
 
         if input.is_empty() {
             continue;
@@ -110,6 +146,7 @@ async fn interactive_loop(
 
         match input.as_str() {
             "/exit" | "/quit" | "/q" => {
+                save_history(&mut rl);
                 println!("  {}  Goodbye.", "👋".dimmed());
                 break;
             }
@@ -119,7 +156,7 @@ async fn interactive_loop(
             }
             "/clear" | "/c" => {
                 print!("\x1B[2J\x1B[H");
-                io::stdout().flush()?;
+                let _ = io::stdout().flush();
                 render::print_banner();
                 continue;
             }
@@ -132,14 +169,14 @@ async fn interactive_loop(
                 continue;
             }
             "/remember" => {
-                prompt_memory();
+                prompt_memory(&mut rl);
                 continue;
             }
-            "/evolve" | "/self-improve" => {
+            "/evolve" => {
                 evolve_dispatch(api, max_retries, bare).await;
                 continue;
             }
-            s if s.starts_with("/evolve ") | s.starts_with("/self-improve ") => {
+            s if s.starts_with("/evolve ") => {
                 let rest = s.splitn(2, ' ').nth(1).unwrap_or("");
                 evolve_dispatch_with(api, max_retries, bare, rest).await;
                 continue;
@@ -147,7 +184,7 @@ async fn interactive_loop(
             s if s.starts_with('/') => {
                 let cmd = s.trim_start_matches('/');
                 println!(
-                    "  {}  Unknown command: /{}. Type /help for commands.",
+                    "  {}  Unknown: /{}.  Type /help for commands.",
                     "✗".red(),
                     cmd
                 );
@@ -156,8 +193,12 @@ async fn interactive_loop(
             _ => {}
         }
 
-        if let Err(e) = run_task(api, &input, auto_yes, max_retries, bare).await {
-            println!("  {}  Error: {}", "✗".red().bold(), e);
+        match run_task(api, &input, auto_yes, max_retries, bare).await {
+            Ok(_) => save_history(&mut rl),
+            Err(e) => {
+                println!("\n  {}  {}", "✗".red().bold(), e.to_string().red());
+                save_history(&mut rl);
+            }
         }
     }
     Ok(())
@@ -176,7 +217,6 @@ async fn run_task(
     let mut state = WorkflowState::new(prompt.to_string(), matched_skills);
     state.max_retries = max_retries;
 
-    // Load context
     let context = if bare {
         String::new()
     } else {
@@ -184,46 +224,48 @@ async fn run_task(
     };
     state.add_message("system", &context);
 
-    // Phase 1: Planning
+    // ── Phase 1: Planning ──
     state.transition(Phase::Planning);
-    println!("\n  {}  Thinking...\n", "⟳".yellow().bold());
+    print!("  {}  ", "⟳".yellow().bold());
+    let _ = io::stdout().flush();
     let plan = planner::generate_plan(api, &mut state, &context).await?;
     render::print_plan_summary(&plan);
 
-    // Phase 2: Awaiting Approval
+    // ── Phase 2: Approval ──
     state.transition(Phase::AwaitingApproval);
-    if !confirm("Proceed with this plan?", auto_yes)? {
+    if !confirm(api, "Proceed with this plan?", auto_yes).await? {
         println!("  {}  Cancelled.", "✗".red());
         return Ok(());
     }
 
-    // Phase 3: Executing
+    // ── Phase 3: Executing ──
     state.transition(Phase::Executing);
     println!();
     executor::execute_plan(api, &mut state).await?;
 
-    // Phase 4: Reviewing
+    // ── Phase 4: Reviewing ──
     state.transition(Phase::Reviewing);
-    println!("\n  {}  Analyzing results...\n", "⟳".yellow().bold());
+    print!("  {}  ", "⟳".yellow().bold());
+    let _ = io::stdout().flush();
     let suggestions = reviewer::review_and_suggest(api, &state).await?;
     state.suggestions = suggestions.clone();
     render::print_suggestions(&suggestions);
 
-    // Phase 5: Awaiting optimization approval
+    // ── Phase 5: Optimize approval ──
     state.transition(Phase::AwaitingOptimizeApproval);
-    if confirm("Apply these improvements?", auto_yes)? {
+    if confirm(api, "Apply these improvements?", auto_yes).await? {
         state.transition(Phase::Optimizing);
         println!();
-        let result = reviewer::apply_optimizations(api, &state).await?;
-        println!("  {}  Optimizations applied.", "✓".green().bold());
-        if !result.is_empty() && !result.contains("ALL_DONE") {
-            println!("  {}", result.dimmed());
+        if let Err(e) = reviewer::apply_optimizations(api, &mut state).await {
+            println!("  {}  {}", "⚠".yellow(), e);
+        } else {
+            println!("  {}  Optimizations applied.", "✓".green().bold());
         }
     } else {
         println!("  {}  Skipping optimizations.", "→".dimmed());
     }
 
-    // Save session artifacts
+    // ── Save artifacts ──
     state.transition(Phase::Done);
     if !bare {
         let journal = memory::save_journal(
@@ -234,7 +276,11 @@ async fn run_task(
         )
         .unwrap_or_default();
         if !journal.is_empty() {
-            println!("  {}  Journal saved: .deepseek/journal/{}", "📓".dimmed(), journal);
+            println!(
+                "  {}  Journal: .deepseek/journal/{}",
+                "📓".dimmed(),
+                journal
+            );
         }
 
         let plan_summary: String = state.plan.lines().take(3).collect::<Vec<_>>().join("; ");
@@ -246,30 +292,34 @@ async fn run_task(
                 "deepseek: {}",
                 prompt.chars().take(72).collect::<String>()
             )) {
-                Ok(_) => println!("  {}  Changes committed to git", "🔀".dimmed()),
+                Ok(_) => println!("  {}  Committed", "🔀".dimmed()),
                 Err(e) => println!("  {}  Git: {}", "⚠".yellow(), e),
             }
         }
     }
 
-    println!("\n  {}  Task complete.", "🎯".green().bold());
+    println!();
+    println!(
+        "  {}  Done. {}",
+        "🎯".green().bold(),
+        "Type another task or /exit".dimmed()
+    );
     Ok(())
 }
 
-fn confirm(message: &str, auto_yes: bool) -> anyhow::Result<bool> {
+async fn confirm(_api: &api::ApiClient, message: &str, auto_yes: bool) -> anyhow::Result<bool> {
     if auto_yes {
-        println!("  {}  {} (auto-approved)", "?".cyan().bold(), message);
+        println!("  {}  {} (auto)", "?".cyan().bold(), message.dimmed());
         return Ok(true);
     }
-
     println!();
-    println!("  {}  {} [Y/n]", "?".cyan().bold(), message);
-    print!("  > ");
-    io::stdout().flush()?;
+    print!("  {}  {}  [Y/n] ", "?".cyan().bold(), message);
+    let _ = io::stdout().flush();
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
+
     let trimmed = input.trim().to_lowercase();
-    println!();
     Ok(trimmed.is_empty() || trimmed == "y" || trimmed == "yes")
 }
 
@@ -302,7 +352,7 @@ fn show_memory() {
             "{} {}",
             "│".cyan().dimmed(),
             format!(
-                "... and {} more lines (see .deepseek/MEMORY.md)",
+                "... and {} more lines (.deepseek/MEMORY.md)",
                 mem.lines().count() - 40
             )
             .dimmed()
@@ -327,64 +377,39 @@ fn show_git() {
     println!();
 }
 
-fn prompt_memory() {
-    println!("  {}  What should I remember about this project?", "🧠".cyan());
-    print!("  {}  ", "   ".cyan());
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_ok() && !input.trim().is_empty() {
-        let _ = memory::append_memory(&format!(
-            "## Manual entry — {}\n\n{}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M"),
-            input.trim()
-        ));
-        println!("  {}  Saved to memory.", "✓".green());
+fn prompt_memory(rl: &mut DefaultEditor) {
+    println!("  {}  What should I remember?", "🧠".cyan());
+    if let Some(input) = read_line(rl, "  > ") {
+        if !input.is_empty() {
+            let _ = memory::append_memory(&format!(
+                "## Manual entry — {}\n\n{}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M"),
+                input
+            ));
+            println!("  {}  Saved.", "✓".green());
+        }
     }
 }
 
 async fn evolve_dispatch(_api: &api::ApiClient, _max_retries: u32, _bare: bool) {
     println!();
+    println!("  {}  Self-improvement", "🧬".bright_magenta().bold());
     println!(
-        "  {}  Self-improvement",
-        "🧬".bright_magenta().bold()
+        "  {}  Source: {}",
+        " ".dimmed(),
+        evolve::source_path().dimmed()
     );
-    println!("  {}  Source: {}", " ".dimmed(), evolve::source_path().dimmed());
     println!();
-    println!("  Subcommands:");
+    println!("  {:<22} {}", "/evolve check".cyan(), "Diagnostics (clippy, fmt, deps, size)");
+    println!("  {:<22} {}", "/evolve fmt".cyan(), "Auto-format with cargo fmt + rebuild");
+    println!("  {:<22} {}", "/evolve fix".cyan(), "Auto-fix clippy warnings + rebuild");
+    println!("  {:<22} {}", "/evolve strip".cyan(), "Strip debug symbols");
+    println!("  {:<22} {}", "/evolve upgrade".cyan(), "Update deps + rebuild");
+    println!("  {:<22} {}", "/evolve build".cyan(), "Rebuild and reinstall");
     println!(
-        "    {}  {}",
-        "/evolve check".cyan(),
-        "Run diagnostics (clippy, formatting, outdated deps, size)"
-    );
-    println!(
-        "    {}  {}",
-        "/evolve fmt".cyan(),
-        "Auto-format code with cargo fmt"
-    );
-    println!(
-        "    {}  {}",
-        "/evolve fix".cyan(),
-        "Auto-fix clippy warnings"
-    );
-    println!(
-        "    {}  {}",
-        "/evolve strip".cyan(),
-        "Strip debug symbols from binary"
-    );
-    println!(
-        "    {}  {}",
-        "/evolve upgrade".cyan(),
-        "Update dependencies (cargo update)"
-    );
-    println!(
-        "    {}  {}",
-        "/evolve build".cyan(),
-        "Rebuild and reinstall"
-    );
-    println!(
-        "    {}  {}",
-        "/evolve <request>".cyan(),
-        "AI-powered self-modification (requires API key)"
+        "  {:<22} {}",
+        "/evolve <task>".cyan(),
+        "AI-powered modification (needs API key)"
     );
     println!();
 }
@@ -396,39 +421,27 @@ async fn evolve_dispatch_with(
     subcommand: &str,
 ) {
     let cmd = subcommand.trim();
-
     match cmd {
         "check" | "diagnose" | "diag" => {
-            println!("\n  {}  Running diagnostics...\n", "🔍".yellow().bold());
-            let result = evolve::run_diagnostics();
-            println!("{}", result);
+            println!("\n  {}  Diagnostics\n", "🔍".yellow().bold());
+            println!("{}", evolve::run_diagnostics());
         }
         "fmt" | "format" => {
-            println!("\n  {}  Formatting code...\n", "🎨".yellow().bold());
-            let result = evolve::auto_format();
-            println!("{}", result);
-            // Also rebuild
-            match evolve::rebuild_and_reinstall().await {
-                Ok(log) => println!("{}", log),
-                Err(e) => println!("  {}  {}", "✗".red(), e),
-            }
+            println!("\n  {}  Formatting\n", "🎨".yellow().bold());
+            println!("{}", evolve::auto_format());
+            rebuild_and_log().await;
         }
         "fix" | "clippy" => {
-            println!("\n  {}  Auto-fixing clippy warnings...\n", "🔧".yellow().bold());
-            let result = evolve::auto_fix_clippy();
-            println!("{}", result);
-            match evolve::rebuild_and_reinstall().await {
-                Ok(log) => println!("{}", log),
-                Err(e) => println!("  {}  {}", "✗".red(), e),
-            }
+            println!("\n  {}  Auto-fixing\n", "🔧".yellow().bold());
+            println!("{}", evolve::auto_fix_clippy());
+            rebuild_and_log().await;
         }
         "strip" => {
-            println!("\n  {}  Stripping binary...\n", "📦".yellow().bold());
-            let result = evolve::strip_binary();
-            println!("{}", result);
+            println!("\n  {}  Stripping\n", "📦".yellow().bold());
+            println!("{}", evolve::strip_binary());
         }
         "upgrade" | "update" => {
-            println!("\n  {}  Updating dependencies...\n", "⬆".yellow().bold());
+            println!("\n  {}  Updating deps\n", "⬆".yellow().bold());
             let src = evolve::source_path();
             match std::process::Command::new("cargo")
                 .args(["update"])
@@ -436,97 +449,69 @@ async fn evolve_dispatch_with(
                 .output()
             {
                 Ok(out) => {
-                    println!(
-                        "  {}",
-                        String::from_utf8_lossy(&out.stdout).trim()
-                    );
-                    println!("  {}  Dependencies updated. Rebuilding...", "✓".green());
-                    match evolve::rebuild_and_reinstall().await {
-                        Ok(log) => println!("{}", log),
-                        Err(e) => println!("  {}  {}", "✗".red(), e),
+                    if out.status.success() {
+                        println!("  {}  Dependencies updated", "✓".green());
+                    } else {
+                        println!(
+                            "  {}  {}",
+                            "✗".red(),
+                            String::from_utf8_lossy(&out.stderr)
+                        );
                     }
                 }
-                Err(e) => println!("  {}  cargo update failed: {}", "✗".red(), e),
-            }
-        }
-        "build" | "rebuild" => {
-            println!("\n  {}  Rebuilding and reinstalling...\n", "🔨".yellow().bold());
-            match evolve::rebuild_and_reinstall().await {
-                Ok(log) => println!("{}", log),
                 Err(e) => println!("  {}  {}", "✗".red(), e),
             }
+            rebuild_and_log().await;
+        }
+        "build" | "rebuild" => {
+            println!("\n  {}  Rebuilding\n", "🔨".yellow().bold());
+            rebuild_and_log().await;
         }
         _ => {
-            println!("\n  {}  AI-powered self-modification...\n", "🧬".bright_magenta().bold());
+            println!(
+                "\n  {}  AI self-modification: {}",
+                "🧬".bright_magenta().bold(),
+                cmd.cyan()
+            );
             let prompt = evolve::self_improvement_prompt(cmd);
             match run_task(api, &prompt, false, max_retries, bare).await {
-                Ok(_) => {
-                    println!();
-                    println!(
-                        "  {}  Rebuilding with changes...",
-                        "🔨".yellow().bold()
-                    );
-                    match evolve::rebuild_and_reinstall().await {
-                        Ok(log) => println!("{}", log),
-                        Err(e) => println!("  {}  {}", "✗".red(), e),
-                    }
-                }
+                Ok(_) => rebuild_and_log().await,
                 Err(e) => println!("  {}  {}", "✗".red(), e),
             }
         }
     }
 }
 
+async fn rebuild_and_log() {
+    match evolve::rebuild_and_reinstall().await {
+        Ok(log) => println!("{}", log),
+        Err(e) => println!("  {}  {}", "✗".red(), e),
+    }
+}
+
 fn print_help() {
     println!();
+    println!("{}", "  Commands".bright_white().bold().underline());
     println!(
-        "  {}",
-        "Commands".bright_white().bold().underline()
-    );
-    println!(
-        "  {}  Type any task to run the full agent pipeline",
+        "  {}  Type any task — runs plan→execute→self-heal→review→optimize",
         "→".dimmed()
     );
-    println!(
-        "  {}    plan → approve → execute → self-heal → suggest → approve → optimize",
-        " ".dimmed()
-    );
     println!();
-    println!("  {:<16} {}", "/help, /h".cyan(), "Show this help");
-    println!("  {:<16} {}", "/exit, /q".cyan(), "Exit the session");
-    println!("  {:<16} {}", "/clear, /c".cyan(), "Clear the screen");
-    println!("  {:<16} {}", "/memory, /m".cyan(), "View project memory");
-    println!("  {:<16} {}", "/git, /g".cyan(), "View git context");
-    println!("  {:<16} {}", "/remember".cyan(), "Add a manual memory entry");
-    println!("  {:<16} {}", "/evolve".cyan(), "Self-improvement menu");
-    println!(
-        "  {:<16} {}",
-        "/evolve check".cyan(),
-        "Run diagnostics (clippy, fmt, deps, size)"
-    );
-    println!(
-        "  {:<16} {}",
-        "/evolve fix".cyan(),
-        "Auto-fix clippy warnings"
-    );
-    println!(
-        "  {:<16} {}",
-        "/evolve build".cyan(),
-        "Rebuild and reinstall"
-    );
-    println!(
-        "  {:<16} {}",
-        "/evolve <task>".cyan(),
-        "AI-powered self-modification"
-    );
+    println!("  {:<20} {}", "/help, /h".cyan(), "Show this help");
+    println!("  {:<20} {}", "/exit, /q".cyan(), "Exit session");
+    println!("  {:<20} {}", "/clear, /c".cyan(), "Clear screen");
+    println!("  {:<20} {}", "/memory, /m".cyan(), "View project memory");
+    println!("  {:<20} {}", "/git, /g".cyan(), "View git context");
+    println!("  {:<20} {}", "/remember".cyan(), "Add manual memory entry");
+    println!("  {:<20} {}", "/evolve".cyan(), "Self-improvement menu");
     println!();
     println!(
-        "  {}",
-        "Flags (one-shot mode only)".bright_white().bold().underline()
+        "{}",
+        "  Flags".bright_white().bold().underline()
     );
-    println!("  {:<16} {}", "--yes".cyan(), "Auto-approve all checkpoints");
-    println!("  {:<16} {}", "--model".cyan(), "Override the default model");
-    println!("  {:<16} {}", "-p <task>".cyan(), "Run a single task (no REPL)");
-    println!("  {:<16} {}", "--bare".cyan(), "Skip memory and git integration");
+    println!("  {:<20} {}", "-p <task>".cyan(), "One-shot task (no REPL)");
+    println!("  {:<20} {}", "--yes".cyan(), "Skip all confirmations");
+    println!("  {:<20} {}", "--model <name>".cyan(), "Override model");
+    println!("  {:<20} {}", "--bare".cyan(), "Skip memory + git");
     println!();
 }
