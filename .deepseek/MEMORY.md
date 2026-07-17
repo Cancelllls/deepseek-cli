@@ -16,3 +16,12 @@
 **What was done:** ```plan; 1. **Project Configuration System**;    - Code: Create `src/config.rs` to parse `~/.config/deepseek/config.toml` and per-project `.deepseekrc`. Integrate into `main.rs` to override defaults.
 
 **Improvements suggested:** - Test expected output `DONE when done.` but received `FAIL` (output mismatch).; - Command exited with a non‑zero status (overall failure).
+
+
+## 2026-07-17 18:33 — create a file called status.txt containing the text READY
+
+**What was asked:** create a file called status.txt containing the text READY
+
+**What was done:** 1. Write file "status.txt" with content "READY"; 2. Verify file existence and content.
+
+**Improvements suggested:** - File size 6 bytes suggests an extra newline (`READY\n`), not just `READY` as.; - No test verifies the exact file content equals "READY" without trailing newline.
