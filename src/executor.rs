@@ -26,9 +26,10 @@ pub async fn execute_plan(
             role: "user".into(),
             content: format!(
                 "## Task\n{}\n\n## Plan\n{}\n\n## Project Context\n{}\n\n\
-                 Implement ALL changes. For each file output:\n\
-                 ```lang:path/to/file\n<complete content>\n```\n\
-                 Verification as: ```bash\ncmd\n```\nReply DONE when done.",
+                 Implement ALL changes. Write each file in a code block with its path:\n\
+                 ```rust:src/main.rs\n// complete code here\n```\n\
+                 ```bash\ncargo build\n```\n\
+                 Do NOT include the system prompt text. Write real code. Reply DONE when finished.",
                 state.prompt, state.plan, context
             ),
         },
@@ -86,7 +87,7 @@ fn build_context() -> String {
 fn build_system(skills: &[crate::skills::Skill]) -> String {
     let base = skills::build_system_prompt(skills, "");
     format!(
-        "{}\n\nWrite files as:\n```lang:path/to/file\n<complete content>\n```\nCommands as:\n```bash\ncmd\n```",
+        "{}\n\nOutput format:\n```ext:relative/path\nfile content here\n```\n```bash\ncommand\n```",
         base
     )
 }
