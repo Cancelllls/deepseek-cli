@@ -6,9 +6,6 @@ use colored::*;
 use regex::Regex;
 use std::io::Write;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 
 pub async fn execute_plan(
     api: &ApiClient,
@@ -18,107 +15,165 @@ pub async fn execute_plan(
     let system = build_system(&state.skills);
 
     println!();
-    let spinner = spinner("Implementing");
+    eprint!("  {}  Working...", "●".yellow());
+    let _ = std::io::stderr().flush();
 
     let messages = vec![
         Message { role: "system".into(), content: system },
         Message {
             role: "user".into(),
             content: format!(
-                "## Task\n{}\n\n## Plan\n{}\n\n## Project Context\n{}\n\n\
-                 Implement ALL changes. Write each file in a code block with its path:\n\
-                 ```rust:src/main.rs\n// complete code here\n```\n\
-                 ```bash\ncargo build\n```\n\
-                 Do NOT include the system prompt text. Write real code. Reply DONE when finished.",
+                "# Task\n{}\n\n# Plan\n{}\n\n# Project\n{}\n\n\
+                 Implement changes. Put each file in a code block with the file path:\n\n\
+                 ```rust:src/main.rs\n// your actual code here\n```\n\n\
+                 Put shell commands in bash blocks:\n\n\
+                 ```bash\ncargo check\n```\n\n\
+                 IMPORTANT: Write REAL code, not placeholders. \
+                 Never include system prompts or example text. \
+                 When all files are written, reply DONE.",
                 state.prompt, state.plan, context
             ),
         },
     ];
 
     let implementation = api.chat(messages).await?;
-    spinner.store(true, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    eprint!("\r{}\r", " ".repeat(30));
+    let _ = std::io::stderr().flush();
 
+    // Parse and apply file blocks
     let written = apply_file_blocks(state, &implementation)?;
     let verified = run_bash_blocks(state, &implementation)?;
 
     if written == 0 && verified == 0 {
         println!("  {}  No changes detected", "→".dimmed());
-        apply_raw_response(state, &implementation)?;
+        // Save raw response for debugging but don't treat as error
+        let _ = std::fs::create_dir_all(".deepseek");
+        let _ = std::fs::write(".deepseek/raw_response.txt", &implementation);
     } else {
-        println!("  {}  {} files, {} checks", "✓".green().bold(), written, verified);
+        println!(
+            "  {}  {} files written, {} checks run",
+            "✓".green().bold(),
+            written,
+            verified
+        );
     }
 
-    state.log("Done");
+    state.log("Implementation complete");
     Ok(())
 }
 
 fn build_context() -> String {
     let mut ctx = String::new();
     if let Ok(cwd) = std::env::current_dir() {
-        ctx.push_str(&format!("Working dir: {}\n\n", cwd.display()));
+        ctx.push_str(&format!("Directory: {}\n", cwd.display()));
     }
-    ctx.push_str("Project files:\n");
+
+    // File listing
     if let Ok(entries) = std::fs::read_dir(".") {
         let mut items: Vec<String> = entries
             .flatten()
             .map(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
                 let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                format!("  {}{}", n, if d { "/" } else { "" })
+                format!("{}{}", n, if d { "/" } else { "" })
             })
-            .filter(|s| !s.contains("/.") && !s.contains("target") && !s.contains("node_modules"))
+            .filter(|s| !s.starts_with('.') && !s.contains("target") && !s.contains("node_modules"))
             .collect();
         items.sort();
-        for item in items.iter().take(50) {
-            ctx.push_str(&format!("{}\n", item));
+        ctx.push_str("Files:\n");
+        for item in items.iter().take(60) {
+            ctx.push_str(&format!("  {}\n", item));
         }
     }
-    for f in &["Cargo.toml", "package.json", "go.mod", "pyproject.toml"] {
+
+    // Key config files - read and include
+    for f in &["Cargo.toml", "package.json", "go.mod", "pyproject.toml", "Makefile"] {
         if std::path::Path::new(f).exists() {
-            if let Ok(content) = std::fs::read_to_string(f) {
-                ctx.push_str(&format!("\n--- {} ---\n{}\n", f, content));
+            if let Ok(c) = std::fs::read_to_string(f) {
+                ctx.push_str(&format!("\n--- {} ---\n{}", f, c));
             }
         }
     }
+
     ctx
 }
 
 fn build_system(skills: &[crate::skills::Skill]) -> String {
     let base = skills::build_system_prompt(skills, "");
     format!(
-        "{}\n\nOutput format:\n```ext:relative/path\nfile content here\n```\n```bash\ncommand\n```",
+        "{}\n\n\
+         You write code that gets saved directly to files. \
+         Every code block with a file path becomes a real file.\n\
+         Format: ```lang:path/to/file.ext\n\n\
+         Rules: Write COMPLETE files. No '// ... rest of file'. No placeholder text.",
         base
     )
 }
 
 fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
-    let re = Regex::new(r"```(?:[a-zA-Z0-9_+#-]+(?::| filename=| ))?(.+?)[\r\n]+([\s\S]*?)```").unwrap();
-    let mut count = 0;
+    let re = Regex::new(
+        r"```(?:[a-zA-Z0-9_+#-]+(?::| filename=| ))?(\S+?)[\r\n]+([\s\S]*?)```"
+    ).unwrap();
 
+    let mut count = 0;
     for cap in re.captures_iter(response) {
         let maybe_path = cap.get(1).unwrap().as_str().trim();
         let content = cap.get(2).unwrap().as_str();
 
-        if maybe_path == "bash" || maybe_path == "sh" || maybe_path == "shell"
-            || maybe_path == "zsh" || maybe_path == "console" || maybe_path == "terminal"
-            || maybe_path.is_empty() || maybe_path == "text" || maybe_path == "plaintext"
-            || maybe_path.starts_with("write_file:") || maybe_path.starts_with("TOOL:")
-            || maybe_path.starts_with("read_file:") || maybe_path.starts_with("run_command:")
+        // Skip non-file blocks
+        let skip = [
+            "bash", "sh", "shell", "zsh", "console", "terminal",
+            "text", "plaintext", "json", "yaml", "yml", "toml", "xml",
+            "diff", "log", "output",
+        ];
+        if skip.contains(&maybe_path.to_lowercase().as_str())
+            || maybe_path.is_empty()
+            || maybe_path.starts_with("write_file:")
+            || maybe_path.starts_with("TOOL:")
+            || maybe_path.starts_with("read_file:")
+            || maybe_path.starts_with("run_command:")
+            || maybe_path.starts_with("search_code:")
+            || maybe_path.starts_with("list_dir:")
+            || maybe_path.starts_with('<')  // template placeholder
+            || maybe_path.starts_with("//") // comment
         {
             continue;
         }
 
-        let is_path = maybe_path.contains('/') || maybe_path.contains(".rs")
-            || maybe_path.contains(".ts") || maybe_path.contains(".js")
-            || maybe_path.contains(".py") || maybe_path.contains(".go")
-            || maybe_path.contains(".toml") || maybe_path.contains(".json")
-            || maybe_path.contains(".yaml") || maybe_path.contains(".yml")
-            || maybe_path.contains(".md") || maybe_path.contains(".html")
-            || maybe_path.contains(".css") || maybe_path.contains(".sql")
-            || maybe_path.contains(".sh") || maybe_path.contains(".txt");
+        // Must look like a file path
+        let looks_like_path = maybe_path.contains('/')
+            || maybe_path.ends_with(".rs")
+            || maybe_path.ends_with(".ts")
+            || maybe_path.ends_with(".js")
+            || maybe_path.ends_with(".jsx")
+            || maybe_path.ends_with(".tsx")
+            || maybe_path.ends_with(".py")
+            || maybe_path.ends_with(".go")
+            || maybe_path.ends_with(".java")
+            || maybe_path.ends_with(".rb")
+            || maybe_path.ends_with(".toml")
+            || maybe_path.ends_with(".json")
+            || maybe_path.ends_with(".yaml")
+            || maybe_path.ends_with(".yml")
+            || maybe_path.ends_with(".md")
+            || maybe_path.ends_with(".html")
+            || maybe_path.ends_with(".css")
+            || maybe_path.ends_with(".sql")
+            || maybe_path.ends_with(".sh")
+            || maybe_path.ends_with(".env")
+            || maybe_path.ends_with(".txt");
 
-        if !is_path || content.trim().is_empty() {
+        if !looks_like_path || content.trim().is_empty() {
+            continue;
+        }
+
+        // Reject content that looks like system prompt / instructions
+        let content_preview = content.trim().chars().take(100).collect::<String>().to_lowercase();
+        if content_preview.contains("write real code")
+            || content_preview.contains("complete content")
+            || content_preview.contains("system prompt")
+            || content_preview.contains("file content here")
+        {
             continue;
         }
 
@@ -128,69 +183,55 @@ fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize>
 
         match std::fs::write(maybe_path, content) {
             Ok(_) => {
-                println!("  {}  {}", "✓".green().bold(), maybe_path.cyan());
+                println!("  {}  {} ({} bytes)", "✓".green().bold(), maybe_path.cyan(), content.len());
                 state.log(&format!("Wrote {}", maybe_path));
                 count += 1;
             }
             Err(e) => println!("  {}  {}: {}", "✗".red(), maybe_path, e),
         }
     }
+
     Ok(count)
 }
 
 fn run_bash_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
     let re = Regex::new(r"```(?:bash|sh|shell|zsh|console)\s*\n([\s\S]*?)```").unwrap();
     let mut count = 0;
+
     for cap in re.captures_iter(response) {
         let script = cap.get(1).unwrap().as_str().trim();
         for line in script.lines() {
-            let cmd = line.trim();
-            if cmd.is_empty() || cmd.starts_with('#') || cmd.starts_with("//") { continue; }
-            let actual = cmd.strip_prefix("$ ").or(cmd.strip_prefix("> ")).unwrap_or(cmd);
-            print!("  {}  {}", "▶".yellow().bold(), actual.dimmed());
-            match Command::new("sh").arg("-c").arg(actual).output() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            // Strip shell prompt prefixes
+            let cmd = line.strip_prefix("$ ").or(line.strip_prefix("> ")).unwrap_or(line);
+
+            print!("  {}  {}", "▶".yellow(), cmd.dimmed());
+            let _ = std::io::stdout().flush();
+
+            match Command::new("sh").arg("-c").arg(cmd).output() {
                 Ok(out) => {
                     let ok = out.status.success();
-                    println!("  {}", if ok { "OK".green() } else { "FAILED".red() });
-                    if !ok {
+                    if ok {
+                        println!("  {}", "OK".green());
+                    } else {
+                        println!("  {}", "FAILED".red());
                         let stderr = String::from_utf8_lossy(&out.stderr);
-                        if !stderr.trim().is_empty() { println!("    {}", stderr.trim().red()); }
+                        if !stderr.trim().is_empty() {
+                            for l in stderr.lines().take(3) {
+                                println!("    {}", l.trim().red());
+                            }
+                        }
                     }
-                    state.log(&format!("Ran `{}` → {}", actual, if ok { "OK" } else { "FAIL" }));
+                    state.log(&format!("Ran `{}` → {}", cmd, if ok { "OK" } else { "FAIL" }));
                 }
                 Err(e) => println!("  {}", format!("ERR: {}", e).red()),
             }
             count += 1;
         }
     }
+
     Ok(count)
-}
-
-fn apply_raw_response(state: &mut WorkflowState, response: &str) -> Result<()> {
-    if !response.contains("```") && response.len() > 50 {
-        let _ = std::fs::create_dir_all(".deepseek");
-        std::fs::write(".deepseek/raw_response.txt", response)?;
-        println!("  {}  Saved raw response", "📝".dimmed());
-    }
-    Ok(())
-}
-
-fn spinner(label: &str) -> Arc<AtomicBool> {
-    let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let done = Arc::new(AtomicBool::new(false));
-    let d = done.clone();
-    let l = label.to_string();
-    std::thread::spawn(move || {
-        let mut i = 0;
-        let mut stderr = std::io::stderr();
-        while !d.load(Ordering::Relaxed) {
-            let _ = write!(stderr, "\r  {}  {}", chars[i % chars.len()].yellow(), l);
-            let _ = stderr.flush();
-            std::thread::sleep(Duration::from_millis(120));
-            i += 1;
-        }
-        let _ = write!(stderr, "\r{}\r", " ".repeat(l.len() + 6));
-        let _ = stderr.flush();
-    });
-    done
 }

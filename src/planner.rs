@@ -42,27 +42,15 @@ pub async fn generate_plan(
 
     let mut stream = Box::pin(api.stream_chat(messages));
     let mut plan = String::new();
-    let mut last_print = Instant::now();
-
-    print!("  ");
-    let _ = io::stdout().flush();
 
     while let Some(event) = stream.next().await {
         match event {
-            api::StreamEvent::Content(text) => {
-                plan.push_str(&text);
-                print!("{}", text);
-                if last_print.elapsed().as_millis() > 50 {
-                    let _ = io::stdout().flush();
-                    last_print = Instant::now();
-                }
-            }
+            api::StreamEvent::Content(text) => plan.push_str(&text),
             api::StreamEvent::Done => break,
             api::StreamEvent::Error(e) => anyhow::bail!(e),
             _ => {}
         }
     }
-    let _ = io::stdout().flush();
 
     state.plan = plan.clone();
     state.add_message("assistant", &plan);

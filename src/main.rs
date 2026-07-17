@@ -225,9 +225,11 @@ async fn run_task(
 
     // ── Plan ──
     state.transition(Phase::Planning);
-    print!("  {}  ", "⟳".yellow().bold());
-    let _ = io::stdout().flush();
+    eprint!("  {}  Planning...", "●".yellow());
+    let _ = std::io::stderr().flush();
     let plan = planner::generate_plan(api, &mut state, &context).await?;
+    eprint!("\r{}\r", " ".repeat(30));
+    let _ = std::io::stderr().flush();
     render::print_plan_summary(&plan);
 
     // ── Confirm ──
@@ -243,9 +245,11 @@ async fn run_task(
 
     // ── Review ──
     state.transition(Phase::Reviewing);
-    print!("  {}  Reviewing... ", "⟳".yellow().bold());
-    let _ = io::stdout().flush();
+    eprint!("  {}  Reviewing...", "●".yellow());
+    let _ = std::io::stderr().flush();
     let suggestions = reviewer::review_and_suggest(api, &state).await?;
+    eprint!("\r{}\r", " ".repeat(30));
+    let _ = std::io::stderr().flush();
     state.suggestions = suggestions.clone();
     render::print_suggestions(&suggestions);
 
