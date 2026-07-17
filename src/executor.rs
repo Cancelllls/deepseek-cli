@@ -7,98 +7,104 @@ use regex::Regex;
 use std::io::Write;
 use std::process::Command;
 
+#[derive(Debug)]
+enum Tool {
+    ReadFile { path: String },
+    WriteFile { path: String, content: String },
+    Bash { cmd: String },
+    ListDir { path: String },
+    Search { pattern: String },
+}
+
 pub async fn execute_plan(
     api: &ApiClient,
     state: &mut WorkflowState,
 ) -> Result<()> {
-    let context = build_context();
     let system = build_system(&state.skills);
-
-    println!();
-    eprint!("  {}  Working...", "●".yellow());
-    let _ = std::io::stderr().flush();
-
-    let messages = vec![
+    let context = build_context();
+    let mut conversation: Vec<Message> = vec![
         Message { role: "system".into(), content: system },
         Message {
             role: "user".into(),
             content: format!(
-                "# Task\n{}\n\n# Plan\n{}\n\n# Project\n{}\n\n\
-                 Implement changes. Put each file in a code block with the file path:\n\n\
-                 ```rust:src/main.rs\n// your actual code here\n```\n\n\
-                 Put shell commands in bash blocks:\n\n\
-                 ```bash\ncargo check\n```\n\n\
-                 IMPORTANT: Write REAL code, not placeholders. \
-                 Never include system prompts or example text. \
-                 When all files are written, reply DONE.",
+                "Task: {}\n\nPlan:\n{}\n\nProject:\n{}\n\nStart by reading files you need, then implement.",
                 state.prompt, state.plan, context
             ),
         },
     ];
 
-    let implementation = api.chat(messages).await?;
-    eprint!("\r{}\r", " ".repeat(30));
-    let _ = std::io::stderr().flush();
+    let mut total_files = 0u32;
+    let max_turns = 12;
 
-    // Parse and apply file blocks
-    let written = apply_file_blocks(state, &implementation)?;
-    let verified = run_bash_blocks(state, &implementation)?;
+    for turn in 1..=max_turns {
+        eprint!("  {}  Turn {}/{}", "●".yellow(), turn, max_turns);
+        let _ = std::io::stderr().flush();
 
-    if written == 0 && verified == 0 {
-        println!("  {}  No changes detected", "→".dimmed());
-        // Save raw response for debugging but don't treat as error
-        let _ = std::fs::create_dir_all(".deepseek");
-        let _ = std::fs::write(".deepseek/raw_response.txt", &implementation);
-    } else {
-        println!(
-            "  {}  {} files written, {} checks run",
-            "✓".green().bold(),
-            written,
-            verified
-        );
-    }
+        let response = api.chat(conversation.clone()).await?;
+        eprint!("\r{}\r", " ".repeat(30));
+        let _ = std::io::stderr().flush();
 
-    state.log("Implementation complete");
+        conversation.push(Message { role: "assistant".into(), content: response.clone() });
 
-    if std::path::Path::new("Cargo.toml").exists() && written > 0 {
-        print!("  {}  cargo check ", "▶".yellow());
-        let _ = std::io::stdout().flush();
-        match Command::new("cargo").args(["check", "--message-format=short"]).output() {
-            Ok(out) => {
-                if out.status.success() {
-                    println!("{}", "OK".green());
-                } else {
-                    println!("{}  — reverting changes", "FAILED".red());
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    for l in stderr.lines().take(5) {
-                        if !l.trim().is_empty() { println!("    {}", l.trim().red()); }
-                    }
-                    // Revert via git if available
-                    if std::path::Path::new(".git").exists() {
-                        let _ = Command::new("git").args(["checkout", "--", "."]).output();
-                        let _ = Command::new("git").args(["clean", "-fd"]).output();
-                        println!("  {}  Changes reverted via git", "↩".cyan());
-                        state.log("Changes reverted — cargo check failed");
-                    }
-                }
+        let tools = parse_tools(&response);
+
+        if tools.is_empty() {
+            if response.to_uppercase().contains("DONE") {
+                break;
             }
-            Err(_) => {}
+            conversation.push(Message {
+                role: "user".into(),
+                content: "Use XML tool tags:\n<read_file path=\"file\" />\n<write_file path=\"file\">code</write_file>\n<bash>command</bash>\n<list_dir path=\".\" />".into(),
+            });
+            continue;
+        }
+
+        let mut results = String::new();
+        for tool in &tools {
+            if matches!(tool, Tool::WriteFile { .. }) { total_files += 1; }
+            match execute_tool(tool).await {
+                Ok(result) => results.push_str(&format!("\n--- {} RESULT ---\n{}\n", tool_name(tool), result)),
+                Err(e) => results.push_str(&format!("\n--- {} ERROR ---\n{}\n", tool_name(tool), e)),
+            }
+        }
+
+        if !results.is_empty() {
+            conversation.push(Message {
+                role: "user".into(),
+                content: format!("Results:{}", results),
+            });
         }
     }
 
+    if total_files > 0 {
+        println!("  {}  {} files in {} turns", "✓".green().bold(), total_files, max_turns);
+    }
+    state.log(&format!("{} files", total_files));
     Ok(())
+}
+
+fn build_system(skills: &[crate::skills::Skill]) -> String {
+    let base = skills::build_system_prompt(skills, "");
+    format!(
+        "{}\n\nTOOLS (use XML tags):\n\
+         <read_file path=\"file.rs\" />\n\
+         <write_file path=\"file.rs\">\ncode here\n</write_file>\n\
+         <bash>cargo check</bash>\n\
+         <list_dir path=\".\" />\n\
+         <search pattern=\"keyword\" />\n\n\
+         Read first, then write. Write COMPLETE files.\n\
+         Reply DONE when finished.",
+        base
+    )
 }
 
 fn build_context() -> String {
     let mut ctx = String::new();
     if let Ok(cwd) = std::env::current_dir() {
-        ctx.push_str(&format!("Directory: {}\n", cwd.display()));
+        ctx.push_str(&format!("Dir: {}\n", cwd.display()));
     }
-
-    // File listing
     if let Ok(entries) = std::fs::read_dir(".") {
-        let mut items: Vec<String> = entries
-            .flatten()
+        let mut items: Vec<String> = entries.flatten()
             .map(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
                 let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -107,192 +113,130 @@ fn build_context() -> String {
             .filter(|s| !s.starts_with('.') && !s.contains("target") && !s.contains("node_modules"))
             .collect();
         items.sort();
-        ctx.push_str("Files:\n");
-        for item in items.iter().take(60) {
+        for item in items.iter().take(40) {
             ctx.push_str(&format!("  {}\n", item));
         }
     }
-
-    // Key config files - read and include
-    for f in &["Cargo.toml", "package.json", "go.mod", "pyproject.toml", "Makefile"] {
+    for f in &["Cargo.toml", "package.json", "go.mod", "pyproject.toml"] {
         if std::path::Path::new(f).exists() {
             if let Ok(c) = std::fs::read_to_string(f) {
                 ctx.push_str(&format!("\n--- {} ---\n{}", f, c));
             }
         }
     }
-
     ctx
 }
 
-fn build_system(skills: &[crate::skills::Skill]) -> String {
-    let base = skills::build_system_prompt(skills, "");
-    format!(
-        "{}\n\n\
-         You write code that gets saved directly to files. \
-         Every code block with a file path becomes a real file.\n\
-         Format: ```lang:path/to/file.ext\n\n\
-         Rules: Write COMPLETE files. No '// ... rest of file'. No placeholder text.",
-        base
-    )
-}
+fn parse_tools(response: &str) -> Vec<Tool> {
+    let mut tools = Vec::new();
 
-fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
-    let re = Regex::new(
-        r"```(?:[a-zA-Z0-9_+#-]+(?::| filename=| ))?(\S+?)[\r\n]+([\s\S]*?)```"
-    ).unwrap();
-
-    let mut count = 0;
-    for cap in re.captures_iter(response) {
-        if count >= 5 {
-            state.log("Hit file write limit (5). Remaining blocks ignored.");
-            break;
-        }
-        let maybe_path = cap.get(1).unwrap().as_str().trim();
-        let content = cap.get(2).unwrap().as_str();
-
-        // Skip non-file blocks
-        let skip = [
-            "bash", "sh", "shell", "zsh", "console", "terminal",
-            "text", "plaintext", "json", "yaml", "yml", "toml", "xml",
-            "diff", "log", "output",
-        ];
-        if skip.contains(&maybe_path.to_lowercase().as_str())
-            || maybe_path.is_empty()
-            || maybe_path.starts_with("write_file:")
-            || maybe_path.starts_with("TOOL:")
-            || maybe_path.starts_with("read_file:")
-            || maybe_path.starts_with("run_command:")
-            || maybe_path.starts_with("search_code:")
-            || maybe_path.starts_with("list_dir:")
-            || maybe_path.starts_with('<')  // template placeholder
-            || maybe_path.starts_with("//") // comment
-        {
-            continue;
-        }
-
-        // Must look like a file path
-        let looks_like_path = maybe_path.contains('/')
-            || maybe_path.ends_with(".rs")
-            || maybe_path.ends_with(".ts")
-            || maybe_path.ends_with(".js")
-            || maybe_path.ends_with(".jsx")
-            || maybe_path.ends_with(".tsx")
-            || maybe_path.ends_with(".py")
-            || maybe_path.ends_with(".go")
-            || maybe_path.ends_with(".java")
-            || maybe_path.ends_with(".rb")
-            || maybe_path.ends_with(".toml")
-            || maybe_path.ends_with(".json")
-            || maybe_path.ends_with(".yaml")
-            || maybe_path.ends_with(".yml")
-            || maybe_path.ends_with(".md")
-            || maybe_path.ends_with(".html")
-            || maybe_path.ends_with(".css")
-            || maybe_path.ends_with(".sql")
-            || maybe_path.ends_with(".sh")
-            || maybe_path.ends_with(".env")
-            || maybe_path.ends_with(".txt");
-
-        if !looks_like_path || content.trim().is_empty() {
-            continue;
-        }
-
-        // Reject content that looks like system prompt / instructions
-        let content_preview = content.trim().chars().take(100).collect::<String>().to_lowercase();
-        if content_preview.contains("write real code")
-            || content_preview.contains("complete content")
-            || content_preview.contains("system prompt")
-            || content_preview.contains("file content here")
-        {
-            continue;
-        }
-
-        if let Some(parent) = std::path::Path::new(maybe_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        match std::fs::write(maybe_path, content) {
-            Ok(_) => {
-                println!("  {}  {} ({} bytes)", "✓".green().bold(), maybe_path.cyan(), content.len());
-                state.log(&format!("Wrote {}", maybe_path));
-                count += 1;
-            }
-            Err(e) => println!("  {}  {}: {}", "✗".red(), maybe_path, e),
+    let write_re = Regex::new(r#"<write_file\s+path="(.+?)">\s*([\s\S]*?)</write_file>"#).unwrap();
+    for cap in write_re.captures_iter(response) {
+        let path = cap.get(1).unwrap().as_str().to_string();
+        let content = cap.get(2).unwrap().as_str().to_string();
+        if !content.trim().is_empty() {
+            tools.push(Tool::WriteFile { path, content });
         }
     }
 
-    Ok(count)
+    let read_re = Regex::new(r#"<read_file\s+path="(.+?)"\s*/>"#).unwrap();
+    for cap in read_re.captures_iter(response) {
+        tools.push(Tool::ReadFile { path: cap.get(1).unwrap().as_str().to_string() });
+    }
+
+    let bash_re = Regex::new(r"<bash>\s*([\s\S]*?)</bash>").unwrap();
+    for cap in bash_re.captures_iter(response) {
+        let cmd = cap.get(1).unwrap().as_str().trim().to_string();
+        if !cmd.is_empty() {
+            tools.push(Tool::Bash { cmd });
+        }
+    }
+
+    let list_re = Regex::new(r#"<list_dir\s+path="(.+?)"\s*/>"#).unwrap();
+    for cap in list_re.captures_iter(response) {
+        tools.push(Tool::ListDir { path: cap.get(1).unwrap().as_str().to_string() });
+    }
+
+    let search_re = Regex::new(r#"<search\s+pattern="(.+?)"\s*/>"#).unwrap();
+    for cap in search_re.captures_iter(response) {
+        tools.push(Tool::Search { pattern: cap.get(1).unwrap().as_str().to_string() });
+    }
+
+    tools
 }
 
-fn run_bash_blocks(state: &mut WorkflowState, response: &str) -> Result<usize> {
-    let re = Regex::new(r"```(?:bash|sh|shell|zsh|console)\s*\n([\s\S]*?)```").unwrap();
-    let mut count = 0;
+fn tool_name(tool: &Tool) -> &str {
+    match tool {
+        Tool::ReadFile { .. } => "read_file",
+        Tool::WriteFile { .. } => "write_file",
+        Tool::Bash { .. } => "bash",
+        Tool::ListDir { .. } => "list_dir",
+        Tool::Search { .. } => "search",
+    }
+}
 
-    for cap in re.captures_iter(response) {
-        let script = cap.get(1).unwrap().as_str().trim();
-        for line in script.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                continue;
+async fn execute_tool(tool: &Tool) -> Result<String> {
+    match tool {
+        Tool::ReadFile { path } => {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    println!("  {}  {}", "📖".dimmed(), path.cyan());
+                    Ok(format!("{} ({}b):\n{}", path, content.len(), content))
+                }
+                Err(e) => {
+                    println!("  {}  {} ({})", "✗".red(), path, e);
+                    Ok(format!("Error: {}\nList directory to find correct path.", e))
+                }
             }
-            // Strip shell prompt prefixes
-            let cmd = line.strip_prefix("$ ").or(line.strip_prefix("> ")).unwrap_or(line);
-
-            if should_skip_command(cmd) {
-                println!("  {}  {} (skipped — unsafe)", "⊘".yellow(), cmd.dimmed());
-                continue;
+        }
+        Tool::WriteFile { path, content } => {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::fs::create_dir_all(parent).ok();
             }
-
+            std::fs::write(path, content)?;
+            println!("  {}  {} ({}b)", "✓".green().bold(), path.cyan(), content.len());
+            Ok(format!("Written {}b to {}", content.len(), path))
+        }
+        Tool::Bash { cmd } => {
             print!("  {}  {}", "▶".yellow(), cmd.dimmed());
             let _ = std::io::stdout().flush();
-
-            match Command::new("sh").arg("-c").arg(cmd).output() {
-                Ok(out) => {
-                    let ok = out.status.success();
-                    if ok {
-                        println!("  {}", "OK".green());
-                    } else {
-                        println!("  {}", "FAILED".red());
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        if !stderr.trim().is_empty() {
-                            for l in stderr.lines().take(3) {
-                                println!("    {}", l.trim().red());
-                            }
-                        }
-                    }
-                    state.log(&format!("Ran `{}` → {}", cmd, if ok { "OK" } else { "FAIL" }));
+            let output = Command::new("sh").arg("-c").arg(cmd).output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let ok = output.status.success();
+            println!("  {}", if ok { "OK".green() } else { "FAILED".red() });
+            if !ok && !stderr.trim().is_empty() {
+                for l in stderr.lines().take(3) {
+                    println!("    {}", l.trim().red());
                 }
-                Err(e) => println!("  {}", format!("ERR: {}", e).red()),
             }
-            count += 1;
+            Ok(format!("EXIT: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                output.status.code().unwrap_or(-1), stdout, stderr))
+        }
+        Tool::ListDir { path } => {
+            let entries = std::fs::read_dir(path)?;
+            let mut items: Vec<String> = entries.flatten()
+                .map(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    let d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    format!("{}{}", n, if d { "/" } else { "" })
+                })
+                .filter(|s| !s.starts_with('.'))
+                .collect();
+            items.sort();
+            println!("  {}  {} ({} items)", "📁".dimmed(), path, items.len());
+            Ok(format!("{}:\n{}", path, items.join("\n")))
+        }
+        Tool::Search { pattern } => {
+            match Command::new("rg").arg("-n").arg("-i").arg("--no-heading").arg(pattern).output() {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let lines: Vec<&str> = text.lines().take(20).collect();
+                    println!("  {}  Search '{}' ({} results)", "🔍".dimmed(), pattern, lines.len());
+                    Ok(if lines.is_empty() { format!("No matches for '{}'", pattern) } else { lines.join("\n") })
+                }
+                Err(e) => Ok(format!("Search failed: {}", e)),
+            }
         }
     }
-
-    Ok(count)
-}
-
-fn should_skip_command(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    if lower.contains("cargo test") && lower.contains("--test") {
-        if let Some(name) = cmd.split_whitespace()
-            .skip_while(|w| *w != "--test")
-            .nth(1)
-        {
-            if !std::path::Path::new(&format!("tests/{}.rs", name)).exists() {
-                return true;
-            }
-        }
-    }
-    if (lower.starts_with("npm ") || lower.starts_with("npx ") || lower.starts_with("node "))
-        && !std::path::Path::new("package.json").exists()
-    {
-        return true;
-    }
-    if lower.starts_with("pip ") && !std::path::Path::new("requirements.txt").exists()
-        && !std::path::Path::new("pyproject.toml").exists()
-    {
-        return true;
-    }
-    false
 }
