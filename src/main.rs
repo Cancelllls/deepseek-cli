@@ -222,71 +222,54 @@ async fn run_task(
     } else {
         memory::full_context()
     };
-    state.add_message("system", &context);
 
-    // ── Phase 1: Planning ──
+    // ── Plan ──
     state.transition(Phase::Planning);
     print!("  {}  ", "⟳".yellow().bold());
     let _ = io::stdout().flush();
     let plan = planner::generate_plan(api, &mut state, &context).await?;
     render::print_plan_summary(&plan);
 
-    // ── Phase 2: Approval ──
-    state.transition(Phase::AwaitingApproval);
-    if !confirm(api, "Proceed with this plan?", auto_yes).await? {
+    // ── Confirm ──
+    if !confirm(api, "Execute this plan?", auto_yes).await? {
         println!("  {}  Cancelled.", "✗".red());
         return Ok(());
     }
 
-    // ── Phase 3: Executing ──
+    // ── Execute ──
     state.transition(Phase::Executing);
     println!();
     executor::execute_plan(api, &mut state).await?;
 
-    // ── Phase 4: Reviewing ──
+    // ── Review ──
     state.transition(Phase::Reviewing);
-    print!("  {}  ", "⟳".yellow().bold());
+    print!("  {}  Reviewing... ", "⟳".yellow().bold());
     let _ = io::stdout().flush();
     let suggestions = reviewer::review_and_suggest(api, &state).await?;
     state.suggestions = suggestions.clone();
     render::print_suggestions(&suggestions);
 
-    // ── Phase 5: Optimize approval ──
-    state.transition(Phase::AwaitingOptimizeApproval);
-    if confirm(api, "Apply these improvements?", auto_yes).await? {
+    // ── Apply improvements (auto if --yes, ask otherwise) ──
+    if auto_yes || confirm(api, "Apply improvements?", true).await? {
         state.transition(Phase::Optimizing);
         println!();
         if let Err(e) = reviewer::apply_optimizations(api, &mut state).await {
             println!("  {}  {}", "⚠".yellow(), e);
-        } else {
-            println!("  {}  Optimizations applied.", "✓".green().bold());
         }
-    } else {
-        println!("  {}  Skipping optimizations.", "→".dimmed());
     }
 
-    // ── Save artifacts ──
+    // ── Save ──
     state.transition(Phase::Done);
     if !bare {
         let journal = memory::save_journal(
-            prompt,
-            &state.plan,
-            &state.execution_log,
-            &state.suggestions,
-        )
-        .unwrap_or_default();
+            prompt, &state.plan, &state.execution_log, &state.suggestions,
+        ).unwrap_or_default();
         if !journal.is_empty() {
-            println!(
-                "  {}  Journal: .deepseek/journal/{}",
-                "📓".dimmed(),
-                journal
-            );
+            println!("  {}  .deepseek/journal/{}", "📓".dimmed(), journal);
         }
-
-        let plan_summary: String = state.plan.lines().take(3).collect::<Vec<_>>().join("; ");
-        let _ = memory::update_memory_after_run(prompt, &plan_summary, &state.suggestions);
+        let summary: String = state.plan.lines().take(3).collect::<Vec<_>>().join("; ");
+        let _ = memory::update_memory_after_run(prompt, &summary, &state.suggestions);
         println!("  {}  Memory updated", "🧠".dimmed());
-
         if is_git_repo() {
             match memory::git_commit(&format!(
                 "deepseek: {}",
@@ -299,11 +282,7 @@ async fn run_task(
     }
 
     println!();
-    println!(
-        "  {}  Done. {}",
-        "🎯".green().bold(),
-        "Type another task or /exit".dimmed()
-    );
+    println!("  {}  Done. Type another task or /exit", "🎯".green().bold());
     Ok(())
 }
 

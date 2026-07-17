@@ -13,60 +13,31 @@ pub async fn review_and_suggest(
     let messages = vec![Message {
         role: "user".into(),
         content: format!(
-            "Review the following completed task and suggest improvements.\n\n\
-             ## Original Task\n{}\n\n\
-             ## Plan\n{}\n\n\
-             ## Execution Log\n{}\n\n\
-             Identify:\n\
-             1. Edge cases that might break the implementation\n\
-             2. Performance optimizations that could be applied\n\
-             3. Error handling improvements\n\
-             4. Code quality improvements (better patterns, deduplication, etc.)\n\
-             5. Missing tests or validations\n\n\
-             For each suggestion, explain WHAT to change and WHY.\n\
-             Group suggestions into categories: BUGS, OPTIMIZATIONS, and POLISH.\n\
-             Be concise and actionable.",
+            "Review these changes and list any issues.\n\n\
+             Task: {}\n\nExecution log:\n{}\n\n\
+             List only concrete issues: bugs, edge cases, missing tests, perf problems.\n\
+             Be brief. One line per issue.",
             state.prompt,
-            state.plan,
             state.execution_log.join("\n")
         ),
     }];
 
     let mut stream = Box::pin(api.stream_chat(messages));
     let mut suggestions = String::new();
-    let mut stderr = io::stderr();
-
-    print!("  ");
-    let _ = io::stdout().flush();
 
     while let Some(event) = stream.next().await {
         match event {
             api::StreamEvent::Content(text) => {
                 suggestions.push_str(&text);
-                if text.contains('\n') {
-                    let lines: Vec<&str> = text.split('\n').collect();
-                    for (i, chunk) in lines.iter().enumerate() {
-                        if i > 0 {
-                            eprint!("\n  ");
-                        }
-                        eprint!("{}", chunk);
-                    }
-                } else {
-                    eprint!("{}", text);
-                }
-                let _ = stderr.flush();
-            }
-            api::StreamEvent::Reasoning(text) => {
-                let _ = stderr.write_all(format!("\x1b[2m{}\x1b[0m", text).as_bytes());
+                print!("{}", text);
+                let _ = io::stdout().flush();
             }
             api::StreamEvent::Done => break,
-            api::StreamEvent::Error(e) => {
-                eprintln!();
-                anyhow::bail!(e);
-            }
+            api::StreamEvent::Error(e) => anyhow::bail!(e),
+            _ => {}
         }
     }
-    eprintln!();
+    println!();
 
     Ok(suggestions)
 }
