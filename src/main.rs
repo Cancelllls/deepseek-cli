@@ -136,7 +136,12 @@ async fn interactive_loop(
                 continue;
             }
             "/evolve" | "/self-improve" => {
-                prompt_evolve(api, max_retries, bare).await;
+                evolve_dispatch(api, max_retries, bare).await;
+                continue;
+            }
+            s if s.starts_with("/evolve ") | s.starts_with("/self-improve ") => {
+                let rest = s.splitn(2, ' ').nth(1).unwrap_or("");
+                evolve_dispatch_with(api, max_retries, bare, rest).await;
                 continue;
             }
             s if s.starts_with('/') => {
@@ -337,63 +342,137 @@ fn prompt_memory() {
     }
 }
 
-async fn prompt_evolve(api: &api::ApiClient, max_retries: u32, bare: bool) {
+async fn evolve_dispatch(_api: &api::ApiClient, _max_retries: u32, _bare: bool) {
     println!();
     println!(
-        "  {}  Self-improvement mode",
+        "  {}  Self-improvement",
         "🧬".bright_magenta().bold()
     );
+    println!("  {}  Source: {}", " ".dimmed(), evolve::source_path().dimmed());
+    println!();
+    println!("  Subcommands:");
     println!(
-        "  {}      Source: {}",
-        " ".dimmed(),
-        evolve::source_path().dimmed()
+        "    {}  {}",
+        "/evolve check".cyan(),
+        "Run diagnostics (clippy, formatting, outdated deps, size)"
     );
     println!(
-        "  {}      I can modify my own code, rebuild, and reinstall myself.",
-        " ".dimmed()
+        "    {}  {}",
+        "/evolve fmt".cyan(),
+        "Auto-format code with cargo fmt"
+    );
+    println!(
+        "    {}  {}",
+        "/evolve fix".cyan(),
+        "Auto-fix clippy warnings"
+    );
+    println!(
+        "    {}  {}",
+        "/evolve strip".cyan(),
+        "Strip debug symbols from binary"
+    );
+    println!(
+        "    {}  {}",
+        "/evolve upgrade".cyan(),
+        "Update dependencies (cargo update)"
+    );
+    println!(
+        "    {}  {}",
+        "/evolve build".cyan(),
+        "Rebuild and reinstall"
+    );
+    println!(
+        "    {}  {}",
+        "/evolve <request>".cyan(),
+        "AI-powered self-modification (requires API key)"
     );
     println!();
+}
 
-    print!("  {}  What should I improve about myself? ", "🧬".bright_magenta());
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
-        println!("  {}  Cancelled.", "✗".red());
-        return;
-    }
+async fn evolve_dispatch_with(
+    api: &api::ApiClient,
+    max_retries: u32,
+    bare: bool,
+    subcommand: &str,
+) {
+    let cmd = subcommand.trim();
 
-    let request = input.trim().to_string();
-    let prompt = evolve::self_improvement_prompt(&request);
-
-    // Run the self-improvement task
-    match run_task(api, &prompt, false, max_retries, bare).await {
-        Ok(_) => {
-            println!();
-            println!(
-                "  {}  Code modified. Rebuilding and reinstalling...",
-                "🔧".yellow().bold()
-            );
+    match cmd {
+        "check" | "diagnose" | "diag" => {
+            println!("\n  {}  Running diagnostics...\n", "🔍".yellow().bold());
+            let result = evolve::run_diagnostics();
+            println!("{}", result);
+        }
+        "fmt" | "format" => {
+            println!("\n  {}  Formatting code...\n", "🎨".yellow().bold());
+            let result = evolve::auto_format();
+            println!("{}", result);
+            // Also rebuild
             match evolve::rebuild_and_reinstall().await {
-                Ok(log) => {
-                    println!("  {}", log.trim().lines().last().unwrap_or("Done"));
-                    println!();
-                    println!("  {}  Restart your session to use the updated binary.", "🎯".green().bold());
-                    println!(
-                        "  {}      The current process still runs the old binary.",
-                        " ".dimmed()
-                    );
-                }
-                Err(e) => {
-                    println!("  {}  Rebuild failed: {}", "✗".red().bold(), e);
-                    println!(
-                        "  {}  Your source changes are saved. Fix and run: cargo build --release",
-                        "💡".yellow()
-                    );
-                }
+                Ok(log) => println!("{}", log),
+                Err(e) => println!("  {}  {}", "✗".red(), e),
             }
         }
-        Err(e) => {
-            println!("  {}  Self-improvement failed: {}", "✗".red().bold(), e);
+        "fix" | "clippy" => {
+            println!("\n  {}  Auto-fixing clippy warnings...\n", "🔧".yellow().bold());
+            let result = evolve::auto_fix_clippy();
+            println!("{}", result);
+            match evolve::rebuild_and_reinstall().await {
+                Ok(log) => println!("{}", log),
+                Err(e) => println!("  {}  {}", "✗".red(), e),
+            }
+        }
+        "strip" => {
+            println!("\n  {}  Stripping binary...\n", "📦".yellow().bold());
+            let result = evolve::strip_binary();
+            println!("{}", result);
+        }
+        "upgrade" | "update" => {
+            println!("\n  {}  Updating dependencies...\n", "⬆".yellow().bold());
+            let src = evolve::source_path();
+            match std::process::Command::new("cargo")
+                .args(["update"])
+                .current_dir(src)
+                .output()
+            {
+                Ok(out) => {
+                    println!(
+                        "  {}",
+                        String::from_utf8_lossy(&out.stdout).trim()
+                    );
+                    println!("  {}  Dependencies updated. Rebuilding...", "✓".green());
+                    match evolve::rebuild_and_reinstall().await {
+                        Ok(log) => println!("{}", log),
+                        Err(e) => println!("  {}  {}", "✗".red(), e),
+                    }
+                }
+                Err(e) => println!("  {}  cargo update failed: {}", "✗".red(), e),
+            }
+        }
+        "build" | "rebuild" => {
+            println!("\n  {}  Rebuilding and reinstalling...\n", "🔨".yellow().bold());
+            match evolve::rebuild_and_reinstall().await {
+                Ok(log) => println!("{}", log),
+                Err(e) => println!("  {}  {}", "✗".red(), e),
+            }
+        }
+        _ => {
+            println!("\n  {}  AI-powered self-modification...\n", "🧬".bright_magenta().bold());
+            let prompt = evolve::self_improvement_prompt(cmd);
+            match run_task(api, &prompt, false, max_retries, bare).await {
+                Ok(_) => {
+                    println!();
+                    println!(
+                        "  {}  Rebuilding with changes...",
+                        "🔨".yellow().bold()
+                    );
+                    match evolve::rebuild_and_reinstall().await {
+                        Ok(log) => println!("{}", log),
+                        Err(e) => println!("  {}  {}", "✗".red(), e),
+                    }
+                }
+                Err(e) => println!("  {}  {}", "✗".red(), e),
+            }
         }
     }
 }
@@ -419,7 +498,27 @@ fn print_help() {
     println!("  {:<16} {}", "/memory, /m".cyan(), "View project memory");
     println!("  {:<16} {}", "/git, /g".cyan(), "View git context");
     println!("  {:<16} {}", "/remember".cyan(), "Add a manual memory entry");
-    println!("  {:<16} {}", "/evolve".cyan(), "Self-improvement — modify my own code");
+    println!("  {:<16} {}", "/evolve".cyan(), "Self-improvement menu");
+    println!(
+        "  {:<16} {}",
+        "/evolve check".cyan(),
+        "Run diagnostics (clippy, fmt, deps, size)"
+    );
+    println!(
+        "  {:<16} {}",
+        "/evolve fix".cyan(),
+        "Auto-fix clippy warnings"
+    );
+    println!(
+        "  {:<16} {}",
+        "/evolve build".cyan(),
+        "Rebuild and reinstall"
+    );
+    println!(
+        "  {:<16} {}",
+        "/evolve <task>".cyan(),
+        "AI-powered self-modification"
+    );
     println!();
     println!(
         "  {}",
