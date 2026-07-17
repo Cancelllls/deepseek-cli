@@ -59,6 +59,27 @@ pub async fn execute_plan(
     }
 
     state.log("Implementation complete");
+
+    if std::path::Path::new("Cargo.toml").exists() {
+        print!("  {}  cargo check ", "▶".yellow());
+        let _ = std::io::stdout().flush();
+        match Command::new("cargo").args(["check"]).output() {
+            Ok(out) => {
+                if out.status.success() {
+                    println!("{}", "OK".green());
+                } else {
+                    println!("{}", "FAILED".red());
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    for l in stderr.lines().take(5) {
+                        if !l.trim().is_empty() { println!("    {}", l.trim().red()); }
+                    }
+                    state.log("cargo check FAILED — project may be broken");
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -117,6 +138,10 @@ fn apply_file_blocks(state: &mut WorkflowState, response: &str) -> Result<usize>
 
     let mut count = 0;
     for cap in re.captures_iter(response) {
+        if count >= 5 {
+            state.log("Hit file write limit (5). Remaining blocks ignored.");
+            break;
+        }
         let maybe_path = cap.get(1).unwrap().as_str().trim();
         let content = cap.get(2).unwrap().as_str();
 
