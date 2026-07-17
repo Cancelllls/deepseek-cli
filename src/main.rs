@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod evolve;
 mod executor;
 mod memory;
 mod planner;
@@ -132,6 +133,10 @@ async fn interactive_loop(
             }
             "/remember" => {
                 prompt_memory();
+                continue;
+            }
+            "/evolve" | "/self-improve" => {
+                prompt_evolve(api, max_retries, bare).await;
                 continue;
             }
             s if s.starts_with('/') => {
@@ -332,6 +337,67 @@ fn prompt_memory() {
     }
 }
 
+async fn prompt_evolve(api: &api::ApiClient, max_retries: u32, bare: bool) {
+    println!();
+    println!(
+        "  {}  Self-improvement mode",
+        "🧬".bright_magenta().bold()
+    );
+    println!(
+        "  {}      Source: {}",
+        " ".dimmed(),
+        evolve::source_path().dimmed()
+    );
+    println!(
+        "  {}      I can modify my own code, rebuild, and reinstall myself.",
+        " ".dimmed()
+    );
+    println!();
+
+    print!("  {}  What should I improve about myself? ", "🧬".bright_magenta());
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {
+        println!("  {}  Cancelled.", "✗".red());
+        return;
+    }
+
+    let request = input.trim().to_string();
+    let prompt = evolve::self_improvement_prompt(&request);
+
+    // Run the self-improvement task
+    match run_task(api, &prompt, false, max_retries, bare).await {
+        Ok(_) => {
+            println!();
+            println!(
+                "  {}  Code modified. Rebuilding and reinstalling...",
+                "🔧".yellow().bold()
+            );
+            match evolve::rebuild_and_reinstall().await {
+                Ok(log) => {
+                    println!("  {}", log.trim().lines().last().unwrap_or("Done"));
+                    println!();
+                    println!("  {}  Restart your session to use the updated binary.", "🎯".green().bold());
+                    println!(
+                        "  {}      The current process still runs the old binary.",
+                        " ".dimmed()
+                    );
+                }
+                Err(e) => {
+                    println!("  {}  Rebuild failed: {}", "✗".red().bold(), e);
+                    println!(
+                        "  {}  Your source changes are saved. Fix and run: cargo build --release",
+                        "💡".yellow()
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            println!("  {}  Self-improvement failed: {}", "✗".red().bold(), e);
+        }
+    }
+}
+
 fn print_help() {
     println!();
     println!(
@@ -353,6 +419,7 @@ fn print_help() {
     println!("  {:<16} {}", "/memory, /m".cyan(), "View project memory");
     println!("  {:<16} {}", "/git, /g".cyan(), "View git context");
     println!("  {:<16} {}", "/remember".cyan(), "Add a manual memory entry");
+    println!("  {:<16} {}", "/evolve".cyan(), "Self-improvement — modify my own code");
     println!();
     println!(
         "  {}",
